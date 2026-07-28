@@ -8,3 +8,6 @@ uploads/
 .env.local
 nginx/ssl/
 dist/
+.next/
+node_modules/
+!frontend/
