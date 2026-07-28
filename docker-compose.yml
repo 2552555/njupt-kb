@@ -1,0 +1,26 @@
+# ============================================
+# 南邮知识库 — 开发环境
+# 启动: docker compose up -d
+# ============================================
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: njupt-kb-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - uploads:/app/uploads
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:///./njupt_kb.db}
+      - SECRET_KEY=${SECRET_KEY:-njupt-kb-dev-secret}
+      - UPLOAD_DIR=/app/uploads
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+    restart: unless-stopped
+
+volumes:
+  uploads:

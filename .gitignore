@@ -1,0 +1,10 @@
+node_modules/
+.next/
+__pycache__/
+*.pyc
+*.db
+uploads/
+.env
+.env.local
+nginx/ssl/
+dist/

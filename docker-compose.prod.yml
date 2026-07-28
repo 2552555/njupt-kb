@@ -1,0 +1,108 @@
+# ============================================
+# 南邮知识库 — 生产部署
+# 启动: docker compose -f docker-compose.prod.yml up -d
+# ============================================
+
+services:
+  # ========== PostgreSQL 数据库 ==========
+  db:
+    image: postgres:16-alpine
+    container_name: njupt-kb-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-njupt}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me-in-production}
+      POSTGRES_DB: ${DB_NAME:-njupt_kb}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-njupt}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - njupt-net
+
+  # ========== Redis 缓存 ==========
+  redis:
+    image: redis:7-alpine
+    container_name: njupt-kb-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - njupt-net
+
+  # ========== FastAPI 后端 ==========
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: njupt-kb-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER:-njupt}:${DB_PASSWORD:-change-me}@db:5432/${DB_NAME:-njupt_kb}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
+      - UPLOAD_DIR=/app/uploads
+      - CORS_ORIGINS=${DOMAIN:-http://localhost}
+      - MAX_UPLOAD_SIZE=52428800
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - njupt-net
+
+  # ========== Next.js 前端 ==========
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-}
+    container_name: njupt-kb-web
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-}
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - njupt-net
+
+  # ========== Nginx 反向代理 ==========
+  nginx:
+    image: nginx:alpine
+    container_name: njupt-kb-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro  # SSL证书目录
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
+    networks:
+      - njupt-net
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
+
+networks:
+  njupt-net:
+    driver: bridge
