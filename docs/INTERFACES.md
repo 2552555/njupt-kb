@@ -43,6 +43,10 @@ async def assert_visible(db: AsyncSession, resource: Resource) -> None
 async def mark_published(db: AsyncSession, *, resource_id, version_id, expected_revision, actor_id, request_id) -> None
 async def mark_withdrawn(db: AsyncSession, *, resource_id, expected_revision, actor_id, reason, request_id) -> None
 async def set_freshness(db: AsyncSession, *, resource_id, status, actor_id) -> None
+async def set_version_review_status(db: AsyncSession, *, version_id, status, actor_id, request_id) -> None
+# 审核结论投影到 resource_versions.review_status 的唯一入口（moderation 调用）。
+async def reassign_resource_course(db: AsyncSession, *, resource_id, course_id, actor_id, reason, request_id) -> None
+# 更正资源课程归属的唯一入口（moderation 调用）；改课程会同时清空 offering_id。
 ```
 
 ## access

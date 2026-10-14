@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 
@@ -30,6 +31,16 @@ SESSIONLESS_PATHS = {
     f"{settings.API_PREFIX}/auth/password-resets/confirm",
     f"{settings.API_PREFIX}/auth/csrf",
 }
+
+# 支付渠道的服务端回调没有浏览器会话，也没有来源头；它的安全边界是验签（§24.3），
+# 因此豁免 CSRF 与来源校验，但不得借此放宽任何权限判断。
+SESSIONLESS_PATTERNS = (
+    re.compile(rf"^{re.escape(settings.API_PREFIX)}/payments/[^/]+/notify$"),
+)
+
+
+def _is_sessionless(path: str) -> bool:
+    return path in SESSIONLESS_PATHS or any(p.match(path) for p in SESSIONLESS_PATTERNS)
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -75,7 +86,10 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         if not path.startswith(settings.API_PREFIX):
             return await call_next(request)
 
-        if path in SESSIONLESS_PATHS:
+        if _is_sessionless(path):
+            # 渠道回调依赖验签而不是来源校验，跳过 Origin 检查。
+            if any(p.match(path) for p in SESSIONLESS_PATTERNS):
+                return await call_next(request)
             if not self._origin_allowed(request):
                 return self._reject(request, "ORIGIN_NOT_ALLOWED", "请求来源不被允许")
             return await call_next(request)
