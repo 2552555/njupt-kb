@@ -1,70 +1,66 @@
+"""密码与会话令牌（设计文档 §14.2）。
+
+- 密码采用专用密码哈希方案：Argon2id。
+- 同站 Web 使用随机会话令牌，数据库只保存令牌摘要，不保存可直接使用的明文令牌。
+"""
+
+from __future__ import annotations
+
 import hashlib
-import uuid
-from datetime import datetime, timedelta, timezone
+import hmac
+import secrets
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerifyMismatchError, VerificationError
 
-from app.config import settings
-from app.database import get_db
+# 参数取 argon2-cffi 默认值（time_cost=3, memory_cost=65536, parallelism=4），
+# 属于库维护的当前推荐基线，不在应用侧另设一套数字。
+_hasher = PasswordHasher()
 
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_DAYS = 7
+MIN_PASSWORD_LENGTH = 10
+MAX_PASSWORD_LENGTH = 256
 
-security_scheme = HTTPBearer()
+SESSION_TOKEN_BYTES = 32
+CSRF_TOKEN_BYTES = 32
+ONE_TIME_TOKEN_BYTES = 32
 
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    return _hasher.hash(password)
 
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return hash_password(plain_password) == hashed_password
-
-
-def create_access_token(user_id: uuid.UUID) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
-    to_encode = {
-        "sub": str(user_id),
-        "exp": expire,
-    }
-    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=ALGORITHM)
-
-
-def decode_token(token: str) -> dict:
+def verify_password(password: str, password_hash: str) -> bool:
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-        )
+        return _hasher.verify(password_hash, password)
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        return False
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
-    db: AsyncSession = Depends(get_db),
-):
-    from app.models.user import User
+def needs_rehash(password_hash: str) -> bool:
+    try:
+        return _hasher.check_needs_rehash(password_hash)
+    except InvalidHashError:
+        return True
 
-    token = credentials.credentials
-    payload = decode_token(token)
-    user_id_str = payload.get("sub")
-    if user_id_str is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload",
-        )
-    user_id = uuid.UUID(user_id_str)
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-        )
-    return user
+
+def generate_token(nbytes: int = SESSION_TOKEN_BYTES) -> str:
+    """生成可直接下发给客户端的一次性随机令牌。"""
+    return secrets.token_urlsafe(nbytes)
+
+
+def token_digest(token: str) -> str:
+    """数据库只保存摘要；摘要用于等值查找，不需要加盐。"""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def constant_time_equal(a: str, b: str) -> bool:
+    return hmac.compare_digest(a, b)
+
+
+def password_problem(password: str) -> str | None:
+    """返回不满足要求的原因，满足时返回 None。错误响应不暴露账号是否存在（§14.2）。"""
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return f"密码至少 {MIN_PASSWORD_LENGTH} 位"
+    if len(password) > MAX_PASSWORD_LENGTH:
+        return "密码过长"
+    return None

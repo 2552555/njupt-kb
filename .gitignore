@@ -1,13 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Next.js
 node_modules/
 .next/
-__pycache__/
-*.pyc
-*.db
-uploads/
+out/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# 环境变量与密钥：不入 Git（设计文档 §28）
 .env
 .env.local
+.env.*.local
+*.pem
+*.key
 nginx/ssl/
+
+# 本地数据
+*.db
+*.sqlite3
+uploads/
+
+# 构建产物
 dist/
-.next/
-node_modules/
-!frontend/
+build/
+
+# Agent 内部目录不得进入公开仓库
+.workbuddy/
+.workbuddy-ai/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

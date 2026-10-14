@@ -1,25 +1,26 @@
+"""Alembic 环境：异步引擎 + 完整模型元数据。
+
+迁移脚本入版本管理，不以启动时 create_all 替代数据库版本演进（设计文档 §31.2）。
 """
-Alembic 迁移环境配置
-支持 SQLite (开发) 和 PostgreSQL (生产) 自动切换
-"""
+
+from __future__ import annotations
+
 import asyncio
-import os
 from logging.config import fileConfig
 
+from alembic import context
 from sqlalchemy import pool
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from alembic import context
+from app.config import settings
+from app.db import Base
 
-from app.database import Base
-from app.models import *  # noqa: 加载所有模型
+# 导入注册表，确保全部模块的表进入 Base.metadata
+import app.models_registry  # noqa: F401
 
 config = context.config
-
-# 从环境变量覆盖数据库URL（生产部署时使用）
-db_url = os.getenv("DATABASE_URL")
-if db_url:
-    config.set_main_option("sqlalchemy.url", db_url)
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -28,26 +29,30 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    """离线模式：生成 SQL 脚本（不连接数据库）"""
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=settings.DATABASE_URL,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        compare_type=True,
+        compare_server_default=True,
     )
     with context.begin_transaction():
         context.run_migrations()
 
 
-def do_run_migrations(connection):
-    context.configure(connection=connection, target_metadata=target_metadata)
+def do_run_migrations(connection: Connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,
+        compare_server_default=True,
+    )
     with context.begin_transaction():
         context.run_migrations()
 
 
 async def run_async_migrations() -> None:
-    """在线模式：连接数据库并执行迁移"""
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
