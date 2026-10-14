@@ -8,23 +8,25 @@ interface BadgeProps {
   className?: string;
 }
 
+// DNDL：默认直角、使用品牌实色色块；正文用 --dn-text-on-color 保证 8 色上的可读性。
+// 状态不能只靠颜色：Badge 内始终携带文字。
 const colorMap: Record<string, string> = {
-  indigo: 'bg-indigo-50 text-indigo-700 ring-indigo-600/20',
-  green: 'bg-green-50 text-green-700 ring-green-600/20',
-  red: 'bg-red-50 text-red-700 ring-red-600/20',
-  yellow: 'bg-yellow-50 text-yellow-700 ring-yellow-600/20',
-  blue: 'bg-blue-50 text-blue-700 ring-blue-600/20',
-  purple: 'bg-purple-50 text-purple-700 ring-purple-600/20',
-  gray: 'bg-gray-50 text-gray-700 ring-gray-600/20',
-  orange: 'bg-orange-50 text-orange-700 ring-orange-600/20',
-  teal: 'bg-teal-50 text-teal-700 ring-teal-600/20',
-  pink: 'bg-pink-50 text-pink-700 ring-pink-600/20',
+  indigo: 'bg-brand text-on-color',
+  teal: 'bg-brand text-on-color',
+  green: 'bg-emerald text-on-color',
+  red: 'bg-crimson text-on-color',
+  pink: 'bg-crimson text-on-color',
+  yellow: 'bg-amber text-on-color',
+  blue: 'bg-cyan text-on-color',
+  purple: 'bg-violet text-on-color',
+  gray: 'bg-steel text-on-color',
+  orange: 'bg-orange text-on-color',
 };
 
-export function Badge({ children, color = 'indigo', className = '' }: BadgeProps) {
+export function Badge({ children, color = 'gray', className = '' }: BadgeProps) {
   return (
     <span
-      className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${colorMap[color]} ${className}`}
+      className={`inline-flex items-center px-2 py-0.5 text-xs font-semibold ${colorMap[color] ?? colorMap.gray} ${className}`}
     >
       {children}
     </span>

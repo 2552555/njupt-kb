@@ -1,0 +1,163 @@
+/*
+ * 设计令牌层 —— DNDL（DreamNight Design Language）v1.0 落地。
+ *
+ * 数值唯一来源是 DNDL 的 tokens.css：本文件保留其 `--dn-*` 原始值与同级关系，
+ * 不重新硬编码品牌色。Tailwind v4 通过 `@theme inline` 把这些变量映射成语义工具类，
+ * 组件与页面只使用语义变量（bg-brand / text-on-color / bg-canvas …）。
+ *
+ * `@theme inline` 让工具类直接内联 `var(--dn-*)` 的值，因此 `bg-brand/50` 这类
+ * 透明度修饰符仍可正常生成。
+ */
+
+:root {
+  color-scheme: light;
+
+  /* --- DNDL 不可变品牌基色（DESIGN.md §2.1）--- */
+  --dn-teal: #59aaa5;
+  --dn-cyan: #70b2d1;
+  --dn-emerald: #72ad8c;
+  --dn-violet: #a18bc8;
+  --dn-amber: #d4ac65;
+  --dn-orange: #d78e74;
+  --dn-steel: #829ba9;
+  --dn-crimson: #c98292;
+  --dn-canvas: #f9fbfa;
+  --dn-surface: #ffffff;
+  --dn-ink-primary: #253b39;
+  --dn-ink-secondary: #657b77;
+  --dn-ink-muted: #82938f;
+  --dn-divider: #e1e9e7;
+
+  /* --- 语义文字色（DESIGN.md §12.1：原始色与语义色分离）--- */
+  --dn-text-primary: var(--dn-ink-primary);
+  --dn-text-secondary: #5b716b;
+  --dn-text-on-color: #102a27;
+  --dn-text-on-ink: var(--dn-surface);
+  --dn-focus: var(--dn-text-on-color);
+  --dn-control-border: var(--dn-text-secondary);
+
+  /* --- 字体（不引入外部字体 CDN，保留回退链）--- */
+  --dn-font: "Segoe UI", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei",
+    "Noto Sans SC", -apple-system, BlinkMacSystemFont, sans-serif;
+  --dn-font-display: "Segoe UI Light", "Segoe UI", "PingFang SC", sans-serif;
+  --dn-weight-display: 300;
+  --dn-weight-body: 400;
+  --dn-weight-kicker: 600;
+  --dn-size-display: clamp(2.75rem, 6.67vw, 6rem);
+  --dn-size-h1: clamp(2rem, 3.34vw, 3rem);
+  --dn-size-h2: clamp(1.375rem, 2.23vw, 2rem);
+  --dn-size-body: 1rem;
+  --dn-size-kicker: 0.6875rem;
+  --dn-leading-display: 1.06;
+  --dn-leading-body: 1.7;
+  --dn-tracking-kicker: 2.2px;
+
+  /* --- 几何：默认直角（DESIGN.md §3.1）--- */
+  --dn-radius: 0px;
+  --dn-target-min: 44px;
+  --dn-focus-width: 2px;
+  --dn-focus-offset: 4px;
+
+  /* --- 层级（阴影只表达层级，不是装饰）--- */
+  --dn-shadow-0: none;
+  --dn-shadow-1: none;
+  --dn-shadow-2: 0 8px 24px rgba(37, 59, 57, 0.14);
+  --dn-shadow-3: 0 18px 48px rgba(37, 59, 57, 0.2);
+  --dn-shadow-4: 0 28px 80px rgba(37, 59, 57, 0.26);
+  --dn-z-floating: 20;
+  --dn-z-panel: 40;
+  --dn-z-modal: 60;
+  --dn-overlay: rgba(16, 42, 39, 0.32);
+
+  /* --- Acrylic：仅用于覆盖层，必须有不透明回退（DESIGN.md §7、§12.2）--- */
+  --dn-acrylic-blur: 16px;
+  --dn-acrylic-opacity: 0.82;
+  --dn-acrylic-background: rgba(255, 255, 255, var(--dn-acrylic-opacity));
+  --dn-acrylic-border: rgba(255, 255, 255, 0.35);
+
+  /* --- 动效：解释状态，支持 prefers-reduced-motion --- */
+  --dn-ease-in: cubic-bezier(0.1, 0.9, 0.2, 1);
+  --dn-ease-out: cubic-bezier(0.7, 0, 1, 0.5);
+  --dn-ease-snap: cubic-bezier(0.17, 0.89, 0.32, 1.18);
+  --dn-duration-hover: 200ms;
+  --dn-duration-press: 140ms;
+  --dn-duration-expand: 380ms;
+  --dn-duration-page: 420ms;
+  --dn-stagger: 45ms;
+  --dn-hover-lift: -3px;
+  --dn-press-scale: 0.975;
+}
+
+/*
+ * 语义工具类映射：Tailwind v4 `@theme inline`。
+ * 命名沿用产品语义（brand / surface / canvas / ink / divider / on-color …），
+ * 值全部指向 DNDL 的 `--dn-*`，避免在组件里重复品牌色。
+ */
+@theme inline {
+  /* 品牌八色 —— 用于大面积实色色块与信息分区 */
+  --color-brand: var(--dn-teal);
+  --color-cyan: var(--dn-cyan);
+  --color-emerald: var(--dn-emerald);
+  --color-violet: var(--dn-violet);
+  --color-amber: var(--dn-amber);
+  --color-orange: var(--dn-orange);
+  --color-steel: var(--dn-steel);
+  --color-crimson: var(--dn-crimson);
+
+  /* 基础面 */
+  --color-canvas: var(--dn-canvas);
+  --color-surface: var(--dn-surface);
+  --color-ink: var(--dn-ink-primary);
+  --color-ink-secondary: var(--dn-ink-secondary);
+  --color-ink-muted: var(--dn-ink-muted);
+  --color-divider: var(--dn-divider);
+
+  /* 语义文字色 */
+  --color-text-primary: var(--dn-text-primary);
+  --color-text-secondary: var(--dn-text-secondary);
+  --color-on-color: var(--dn-text-on-color);
+  --color-on-ink: var(--dn-text-on-ink);
+
+  /* 控件与焦点 */
+  --color-control-border: var(--dn-control-border);
+  --color-focus: var(--dn-focus);
+  --color-overlay: var(--dn-overlay);
+
+  /* 状态语义（不依赖单一颜色表达：配套文字与图标） */
+  --color-success: var(--dn-emerald);
+  --color-danger: var(--dn-crimson);
+  --color-warning: var(--dn-amber);
+  --color-info: var(--dn-cyan);
+
+  /* 字体族 */
+  --font-sans: var(--dn-font);
+  --font-display: var(--dn-font-display);
+
+  /* 几何：全部为直角 */
+  --radius-none: var(--dn-radius);
+  --radius-sm: var(--dn-radius);
+  --radius-md: var(--dn-radius);
+  --radius-lg: var(--dn-radius);
+  --radius-xl: var(--dn-radius);
+  --radius-full: 9999px; /* 仅头像/图标等确有功能需要的圆形元素 */
+
+  /* 层级 */
+  --shadow-1: var(--dn-shadow-1);
+  --shadow-2: var(--dn-shadow-2);
+  --shadow-3: var(--dn-shadow-3);
+  --shadow-4: var(--dn-shadow-4);
+
+  /* 动效曲线 */
+  --ease-in: var(--dn-ease-in);
+  --ease-out: var(--dn-ease-out);
+  --ease-snap: var(--dn-ease-snap);
+}
+
+/*
+ * 项目局部 Token（AGENTS.md：项目网格与断点可以是局部变量，不升级为品牌 Token）。
+ * 仅表达产品语义，不与 DNDL 现有 Token 重复。
+ */
+:root {
+  --ui-target: var(--dn-target-min);
+  --ui-header-h: 60px;
+}
