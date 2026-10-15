@@ -24,14 +24,18 @@ export function Card({
   onClick,
   padding = 'md',
 }: CardProps) {
-  return (
-    <div
-      onClick={onClick}
-      className={`bg-white rounded-xl border border-gray-200 ${
-        hover ? 'hover:shadow-md hover:border-gray-300 transition-shadow cursor-pointer' : ''
-      } ${paddingClasses[padding]} ${className}`}
-    >
-      {children}
-    </div>
-  );
+  const base = `bg-surface border border-divider ${
+    hover ? 'transition-shadow duration-200 hover:shadow-2 hover:-translate-y-0.5' : ''
+  } ${paddingClasses[padding]} ${className}`;
+
+  // 可点击卡片渲染为 button，保证键盘可达与可见焦点。
+  if (onClick) {
+    return (
+      <button type="button" onClick={onClick} className={`block w-full text-left ${base}`}>
+        {children}
+      </button>
+    );
+  }
+
+  return <div className={base}>{children}</div>;
 }

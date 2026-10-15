@@ -1,22 +1,95 @@
+/*
+ * 全局样式入口。
+ * 令牌层（DNDL）由 ./styles/tokens.css 提供；本文件只做基础层与少量工具类，
+ * 不定义页面视觉参数（设计文档 §26.2：统一颜色、间距、字号、圆角与状态组件）。
+ */
 @import "tailwindcss";
+@import "../styles/tokens.css";
 
-@theme inline {
-  --color-background: #ffffff;
-  --color-foreground: #171717;
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+/* 显式声明扫描范围：src 下的全部 TS/TSX（组件与页面），避免自动探测遗漏。 */
+@source "../**/*.{ts,tsx}";
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--dn-canvas);
+    color: var(--dn-text-primary);
+    font-family: var(--dn-font);
+    font-weight: var(--dn-weight-body);
+    line-height: var(--dn-leading-body);
+  }
+
+  /* 焦点必须可见（DESIGN.md §12.3）：不依赖颜色之外无提示，用轮廓 + 偏移。 */
+  :focus-visible {
+    outline: var(--dn-focus-width) solid var(--dn-focus);
+    outline-offset: var(--dn-focus-offset);
+  }
+
+  /* 强制颜色模式保留系统轮廓。 */
+  @media (forced-colors: active) {
+    :focus-visible {
+      outline: 2px solid CanvasText;
+    }
+  }
+
+  /* 减少动态效果：保留全部信息与操作，仅去掉非必要位移。 */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
 }
 
-body {
-  background: #f5f5f5;
-  color: #171717;
-  font-family: Arial, Helvetica, sans-serif;
+@layer components {
+  /* Acrylic：只用于覆盖层；先给不透明回退，支持模糊时才开启（DESIGN.md §7、§12.2）。 */
+  .dn-acrylic {
+    background-color: var(--dn-surface);
+    border-bottom: 1px solid var(--dn-divider);
+  }
+
+  @supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .dn-acrylic {
+      background-color: var(--dn-acrylic-background);
+      backdrop-filter: blur(var(--dn-acrylic-blur));
+      -webkit-backdrop-filter: blur(var(--dn-acrylic-blur));
+    }
+  }
+
+  /* 用户关闭透明效果时使用不透明回退。 */
+  [data-dn-transparency="off"] .dn-acrylic {
+    background-color: var(--dn-surface);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  /* Kicker：品牌表达性排版的小标题。 */
+  .dn-kicker {
+    font-size: var(--dn-size-kicker);
+    font-weight: var(--dn-weight-kicker);
+    letter-spacing: var(--dn-tracking-kicker);
+    text-transform: uppercase;
+  }
+
+  /* 表达性显示字重。 */
+  .dn-display {
+    font-family: var(--dn-font-display);
+    font-weight: var(--dn-weight-display);
+    line-height: var(--dn-leading-display);
+  }
 }
 
-/* Scrollbar styles */
+/* 滚动条：直角、低干扰。 */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 
 ::-webkit-scrollbar-track {
@@ -24,10 +97,9 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #d1d5db;
-  border-radius: 3px;
+  background: var(--dn-divider);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #9ca3af;
+  background: var(--dn-ink-muted);
 }

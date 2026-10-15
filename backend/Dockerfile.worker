@@ -1,0 +1,35 @@
+# Worker 镜像：额外提供预览转换所需的无头办公套件与字体。
+# 转换器以受限权限、临时目录、无网络的方式运行（设计文档 §16.1）。
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/tmp
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libreoffice-writer \
+        libreoffice-impress \
+        libreoffice-calc \
+        fonts-noto-cjk \
+        fonts-dejavu-core \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY alembic.ini ./
+COPY alembic ./alembic
+COPY app ./app
+COPY scripts ./scripts
+
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /tmp/lo-profile \
+    && chown -R appuser:appuser /app /tmp/lo-profile
+USER appuser
+
+CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "-Q", "njupt", "-l", "info"]

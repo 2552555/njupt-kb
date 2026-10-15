@@ -1,21 +1,25 @@
-import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
-import "./globals.css";
-import { Providers } from "./providers";
+import type { Metadata, Viewport } from 'next';
+import './globals.css';
+import { Providers } from './providers';
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
+const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
 
 export const metadata: Metadata = {
-  title: "南邮知识库 - NJUPT Knowledge Base",
-  description: "南京邮电大学最大的学生成长资料平台",
+  metadataBase: new URL(siteUrl),
+  title: {
+    default: '南邮课程知识平台',
+    template: '%s · 南邮课程知识平台',
+  },
+  description:
+    '南京邮电大学课程资料与学习内容平台：按课程、学期与类型查找可追溯的学习资料。',
+  applicationName: '南邮课程知识平台',
+  formatDetection: { telephone: false },
+};
+
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  themeColor: '#59AAA5',
 };
 
 export default function RootLayout({
@@ -24,11 +28,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="zh-CN"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
-      <body className="h-full">
+    <html lang="zh-CN" className="h-full antialiased">
+      <body className="min-h-full bg-canvas text-text-primary">
         <Providers>{children}</Providers>
       </body>
     </html>

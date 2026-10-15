@@ -10,9 +10,9 @@ interface StarRatingProps {
 }
 
 const sizeClasses = {
-  sm: 'w-3.5 h-3.5',
-  md: 'w-5 h-5',
-  lg: 'w-6 h-6',
+  sm: 'h-3.5 w-3.5',
+  md: 'h-5 w-5',
+  lg: 'h-6 w-6',
 };
 
 export function StarRating({
@@ -21,22 +21,25 @@ export function StarRating({
   size = 'md',
   showValue = false,
 }: StarRatingProps) {
+  const rounded = Math.round(rating * 10) / 10;
+
   return (
-    <div className="flex items-center gap-0.5">
+    <div
+      className="flex items-center gap-0.5"
+      role="img"
+      aria-label={`评分 ${rounded.toFixed(1)} 分（满分 ${maxStars} 分）`}
+    >
       {Array.from({ length: maxStars }).map((_, i) => (
         <Star
           key={i}
+          aria-hidden="true"
           className={`${sizeClasses[size]} ${
-            i < Math.floor(rating)
-              ? 'text-amber-400 fill-amber-400'
-              : i < rating
-              ? 'text-amber-400 fill-amber-400 opacity-50'
-              : 'text-gray-300'
+            i < Math.round(rating) ? 'fill-amber text-amber' : 'text-divider'
           }`}
         />
       ))}
       {showValue && (
-        <span className="ml-1.5 text-sm text-gray-600">{rating.toFixed(1)}</span>
+        <span className="ml-1.5 text-sm text-text-secondary">{rounded.toFixed(1)}</span>
       )}
     </div>
   );
