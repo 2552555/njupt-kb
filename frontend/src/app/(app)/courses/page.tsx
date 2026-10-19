@@ -69,7 +69,7 @@ export default async function CoursesPage({
         <p className="dn-kicker">COURSES</p>
         <h1 className="dn-display mt-2 text-3xl">课程列表</h1>
         <p className="mt-2 max-w-2xl text-on-ink">
-          按课程名称、代码、简称或专业筛选。课程代码可能随培养方案变化，同名课程默认分开。
+          课程代码可能随培养方案变化，同名课程默认分开。
         </p>
       </header>
 
@@ -157,7 +157,7 @@ export default async function CoursesPage({
           <p className="text-sm text-text-secondary">
             共显示 {listResult.data.items.length} 门课程
           </p>
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="dn-stagger grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {listResult.data.items.map((course) => (
               <CourseCard key={course.id} course={course} />
             ))}
@@ -181,8 +181,8 @@ export default async function CoursesPage({
       ) : (
         <Notice tone="info" title={hasFilters ? '没有匹配的课程' : '课程目录中还没有课程'}>
           {hasFilters
-            ? '可以放宽筛选条件，或换一个课程名、代码或简称再试。'
-            : '目录由维护者导入真实数据后在此显示。'}
+            ? '换个关键词，或放宽筛选条件。'
+            : '目录由维护者导入。'}
         </Notice>
       )}
     </div>

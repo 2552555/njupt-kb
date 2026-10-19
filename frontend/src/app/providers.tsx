@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react';
 import { Toaster } from 'react-hot-toast';
 
 import { ensureCsrfToken } from '@/lib/api/client';
+import { installTrustedTypesPolicy } from '@/lib/trusted-types';
 import { useAuthStore } from '@/stores/authStore';
 
 export function Providers({ children }: { children: React.ReactNode }) {
@@ -22,6 +23,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
   );
 
   useEffect(() => {
+    // Trusted Types 受限 policy：只在支持该 API 的浏览器注册；不提供 HTML/脚本注入能力。
+    installTrustedTypesPolicy();
     // 先取 CSRF 令牌，再探测会话；不阻塞首屏渲染（不再用全屏加载遮罩）。
     void ensureCsrfToken().finally(() => {
       void useAuthStore.getState().hydrate();

@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, HttpUrl, field_validator
 
 
 class RegisterRequest(BaseModel):
@@ -38,6 +39,25 @@ class EmailVerificationConfirmRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+    otp: str | None = Field(default=None, max_length=64)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=300)
+    new_password: str = Field(min_length=1, max_length=300)
+
+
+class EmailChangeRequestDTO(BaseModel):
+    """发起邮箱换绑：需当前密码确认，确认链接发往新邮箱（0.0.3）。"""
+
+    new_email: EmailStr
+    password: str = Field(min_length=1, max_length=300)
+
+
+class EmailChangeConfirmRequest(BaseModel):
+    """确认邮箱换绑：令牌一次性、有时效，确认后旧会话全部失效。"""
+
+    token: str = Field(min_length=1)
 
 
 class PasswordResetRequest(BaseModel):
@@ -67,9 +87,12 @@ class MeResponse(BaseModel):
     id: uuid.UUID
     email: str
     role: str
+    permissions: list[str] = Field(default_factory=list)
     status: str
     display_name: str
     avatar_url: str | None = None
+    gender: str | None = None
+    bio: str | None = None
     email_verified: bool
     # 校园身份校验方案确定前恒为 False，不宣称完成官方学生身份认证（D03、§15.1）。
     school_verified: bool
@@ -86,10 +109,22 @@ class MeUpdateRequest(BaseModel):
 
     display_name: str | None = Field(default=None, max_length=80)
     avatar_url: str | None = Field(default=None, max_length=500)
+    gender: Literal["male", "female", "nonbinary", "undisclosed"] | None = None
+    bio: str | None = Field(default=None, max_length=500)
     college_id: uuid.UUID | None = None
     major_id: uuid.UUID | None = None
     enrollment_year: int | None = Field(default=None, ge=1900, le=2100)
     preferences: dict | None = None
+
+    @field_validator("avatar_url")
+    @classmethod
+    def validate_avatar(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        url = HttpUrl(value)
+        if url.scheme != "https" or url.username or url.password:
+            raise ValueError("头像需要不含账号密码的 HTTPS 图片地址")
+        return str(url)
 
 
 class SessionItem(BaseModel):
@@ -102,3 +137,11 @@ class SessionItem(BaseModel):
     user_agent: str | None = None
     client_ip: str | None = None
     current: bool = False
+
+
+class DeletionRequest(BaseModel):
+    """注销账号请求（§9）。确认词是否匹配由 service 判定，避免误触。"""
+
+    password: str
+    confirm: str = Field(min_length=1, max_length=40)
+

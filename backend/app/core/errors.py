@@ -12,13 +12,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.config import settings
+
 DEFAULT_CODES: dict[int, str] = {
     status.HTTP_400_BAD_REQUEST: "BAD_REQUEST",
     status.HTTP_401_UNAUTHORIZED: "UNAUTHENTICATED",
     status.HTTP_403_FORBIDDEN: "FORBIDDEN",
     status.HTTP_404_NOT_FOUND: "NOT_FOUND",
     status.HTTP_409_CONFLICT: "CONFLICT",
-    status.HTTP_422_UNPROCESSABLE_ENTITY: "VALIDATION_ERROR",
+    status.HTTP_422_UNPROCESSABLE_CONTENT: "VALIDATION_ERROR",
     status.HTTP_429_TOO_MANY_REQUESTS: "RATE_LIMITED",
     status.HTTP_503_SERVICE_UNAVAILABLE: "DEPENDENCY_UNAVAILABLE",
 }
@@ -37,6 +39,7 @@ class AppError(Exception):
         code: str | None = None,
         http_status: int | None = None,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -45,10 +48,12 @@ class AppError(Exception):
         if http_status is not None:
             self.http_status = http_status
         self.details = details or {}
+        # 429 等需要随响应下发的头（如 Retry-After）；不改变错误体形状。
+        self.headers = headers or None
 
 
 class InvalidInput(AppError):
-    http_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+    http_status = status.HTTP_422_UNPROCESSABLE_CONTENT
     code = "VALIDATION_ERROR"
 
 
@@ -116,12 +121,13 @@ def install_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=exc.http_status,
             content=error_body(exc.code, exc.message, _request_id(request), exc.details),
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content=error_body(
                 "VALIDATION_ERROR",
                 "请求参数不符合要求",
@@ -136,4 +142,17 @@ def install_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=exc.status_code,
             content=error_body(code, str(exc.detail), _request_id(request), None),
+        )
+
+    @app.exception_handler(Exception)
+    async def _unhandled_error(request: Request, exc: Exception) -> JSONResponse:
+        # 生产环境不向客户端泄露堆栈/内部路径/配置细节；dev 环境保留异常信息便于排查。
+        if settings.is_prod:
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content=error_body("INTERNAL_ERROR", "服务器内部错误", _request_id(request), None),
+            )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=error_body("INTERNAL_ERROR", str(exc), _request_id(request), None),
         )

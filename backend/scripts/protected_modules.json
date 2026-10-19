@@ -1,0 +1,22 @@
+{
+  "comment": "可选的 Python 编译保护目标：只选接口稳定、可独立验证的纯计算模块，不编译路由、认证流程、数据库与任务队列。",
+  "targets": [
+    {
+      "module": "app.core.security",
+      "reason": "密码哈希、令牌生成与摘要、常数时间比较；输入输出契约稳定，适合编译为扩展。",
+      "verify": ["hash_password/verify_password", "generate_token/token_digest", "password_problem"]
+    },
+    {
+      "module": "app.core.pagination",
+      "reason": "游标编解码与分页参数校验；纯计算，无 I/O。",
+      "verify": ["encode_cursor/decode_cursor"]
+    }
+  ],
+  "excluded": [
+    "app.main",
+    "app.modules.*.router",
+    "app.modules.identity.service",
+    "app.db",
+    "app.workers"
+  ]
+}

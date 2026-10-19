@@ -8,33 +8,36 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import Uuid, bindparam, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core import idempotency as idem
 from app.core.audit import record_audit
+from app.core.ratelimit import cache_delete, check_rate_limit
 from app.core.enums import (
     Capability,
+    DerivativeKind,
     FilePurpose,
     GrantStatus,
     Role,
     ScanStatus,
     ScopeType,
 )
-from app.core.errors import Conflict, Forbidden, NotFound, RateLimited
+from app.core.errors import Conflict, Forbidden, InvalidInput, NotFound, RateLimited
 from app.core.pagination import (
     CursorPage,
-    decode_cursor,
+    seek_descending,
     encode_cursor,
     normalize_page_size,
 )
-from app.core.permissions import RESOURCE_REVIEW, has_permission, is_active_account
+from app.core.permissions import RESOURCE_PUBLISH, RESOURCE_REVIEW, effective_permissions, is_active_account
 from app.core.storage import storage
 from app.modules.access.models import (
     AccessPolicy,
@@ -49,11 +52,15 @@ from app.modules.access.schemas import (
     EntitlementCreate,
     EntitlementOut,
     PreviewGrantResult,
+    PreviewPageOut,
 )
+from app.db import async_session_factory
 
 if TYPE_CHECKING:  # pragma: no cover
     from app.modules.content.models import Resource, ResourceFile, ResourceVersion, VersionFile
     from app.modules.identity.models import User
+
+logger = logging.getLogger("app.access")
 
 # --- 固定策略参数（首期反滥用粗粒度限制，非收费额度；D05 不接现金/积分）---
 DOWNLOAD_GRANT_SCOPE = "access.download-grant"
@@ -131,8 +138,9 @@ async def authorize(
             raise NotFound("资源版本不存在")
 
     # 步骤 3：文件安全状态（作者/管理员同样不得绕过）
-    _, resource_file = await _resolve_file(db, version_id=version_id, file_id=file_id)
-    _assert_file_safe(resource_file)
+    if capability is not Capability.READ_METADATA:
+        _, resource_file = await _resolve_file(db, version_id=version_id, file_id=file_id)
+        _assert_file_safe(resource_file)
 
     # 步骤 4：内容来源允许的分发范围
     await _assert_distribution_allowed(db, version_id=version_id, capability=capability)
@@ -186,23 +194,72 @@ async def issue_preview_grant(
     version_id: uuid.UUID,
     request_id: str,
 ) -> PreviewGrantResult:
-    """获得允许的预览访问凭证；只签发派生产物的短期 URL。"""
+    """获得允许的预览访问凭证；只签发派生产物的短期 URL。
+
+    优先级（prevew.md 五、十二）：按用户生成/复用的第一页水印图片（WebP）→
+    受限预览 PDF → 缩略图。权限判定不变：未获授权者仍由 authorize 拒绝。
+    """
     await authorize(
         db, user=user, resource_id=resource_id, version_id=version_id, capability=Capability.PREVIEW
     )
 
-    from app.modules.content.service import get_version
+    from app.modules.content.service import (
+        ensure_watermarked_preview_pages,
+        get_resource,
+        get_version,
+    )
 
     version = await get_version(db, version_id)
+    if version.preview_disabled:
+        raise NotFound("作者已关闭该版本的预览", code="PREVIEW_DISABLED")
     _, resource_file = await _resolve_file(db, version_id=version_id, file_id=None)
 
-    derivative = await _find_preview_derivative(db, source_file_id=resource_file.id)
-    if derivative is None:
-        # 不假显示"预览就绪"（§13.1）
-        raise NotFound("该内容的预览尚未就绪", code="PREVIEW_NOT_READY")
-    derivative_id, storage_key = derivative
+    from app.core.errors import DependencyUnavailable
 
-    signed = await storage.presign_download(storage_key, bucket=settings.S3_BUCKET_PRIVATE)
+    pages: list[PreviewPageOut] = []
+    try:
+        watermarked_pages = await ensure_watermarked_preview_pages(
+            db, source_file=resource_file, user=user
+        )
+    except (DependencyUnavailable, NotFound, OSError):
+        # 原件读取/派生上传失败时仍可使用已经就绪的受限预览。
+        watermarked_pages = []
+    if watermarked_pages:
+        derivative_id, storage_key, preview_type = (
+            watermarked_pages[0].id,
+            watermarked_pages[0].storage_key,
+            "image",
+        )
+        # 每页单独签发短期 URL：一页的 URL 不能用于取其他页。
+        for row in watermarked_pages:
+            page_signed = await storage.presign_preview_download(
+                row.storage_key, bucket=settings.S3_BUCKET_PRIVATE
+            )
+            pages.append(
+                PreviewPageOut(
+                    page_no=int(row.page_no or 1),
+                    url=page_signed.url,
+                    url_expires_at=page_signed.expires_at,
+                )
+            )
+    else:
+        found = await _find_preview_derivative(db, source_file_id=resource_file.id)
+        if found is None:
+            # 不假显示"预览就绪"（§13.1）
+            raise NotFound("该内容的预览尚未就绪", code="PREVIEW_NOT_READY")
+        derivative_id, storage_key, kind = found
+        preview_type = _preview_type_of(kind)
+
+    # 首次渲染可能耗时较长；交付前重新读取授权事实，不能沿用渲染前的权限快照。
+    await db.refresh(await get_resource(db, resource_id))
+    await db.refresh(version)
+    await db.refresh(resource_file)
+    if user is not None:
+        await db.refresh(user)
+    await authorize(db, user=user, resource_id=resource_id, version_id=version_id, capability=Capability.PREVIEW)
+    if version.preview_disabled:
+        raise NotFound("作者已关闭该版本的预览", code="PREVIEW_DISABLED")
+    signed = await storage.presign_preview_download(storage_key, bucket=settings.S3_BUCKET_PRIVATE)
     grant = PreviewGrant(
         user_id=user.id if user is not None else None,
         resource_id=resource_id,
@@ -210,10 +267,18 @@ async def issue_preview_grant(
         file_id=resource_file.id,
         derivative_id=derivative_id,
         status=GrantStatus.ISSUED.value,
-        valid_until=signed.expires_at,
+        valid_until=_now() + timedelta(seconds=settings.PREVIEW_URL_TTL_SECONDS),
     )
     db.add(grant)
     await db.flush()
+
+    from app.modules.access.watermark_integrity import compute_watermark_token
+
+    watermark_token = compute_watermark_token(
+        user_id=str(user.id) if user is not None else None,
+        resource_id=str(resource_id),
+        version_id=str(version_id),
+    )
 
     return PreviewGrantResult(
         grant_id=grant.id,
@@ -221,7 +286,117 @@ async def issue_preview_grant(
         url_expires_at=signed.expires_at,
         file_name=resource_file.original_name,
         version_no=version.version_no,
+        preview_type=preview_type,
+        watermark_token=watermark_token,
+        pages=pages,
+        watermarked=bool(pages),
     )
+
+
+# --------------------------------------------------------------------------
+# 预览撤权硬化（§17.1：撤权后已签发的预览凭证不可再被复用，记录可审计）
+# --------------------------------------------------------------------------
+_REVOKABLE_PREVIEW_STATUSES = (
+    GrantStatus.ISSUED.value,
+    GrantStatus.CONSUMED.value,
+)
+
+
+async def revoke_preview_grant(
+    db: AsyncSession,
+    *,
+    actor: "User",
+    grant_id: uuid.UUID,
+    reason: str,
+    request_id: str,
+) -> "PreviewGrant":
+    """撤销单条预览凭证。已撤销则幂等报错，避免重复审计（§29）。"""
+    if not reason or len(reason.strip()) > 255:
+        raise InvalidInput("撤权理由须为 1–255 字")
+    grant = (
+        await db.execute(select(PreviewGrant).where(PreviewGrant.id == grant_id))
+    ).scalar_one_or_none()
+    if grant is None:
+        raise NotFound("预览凭证不存在")
+    if _as_str(grant.status) == GrantStatus.REVOKED.value:
+        raise Conflict("该预览凭证已撤销", code="PREVIEW_GRANT_ALREADY_REVOKED")
+
+    before = {"status": grant.status}
+    grant.status = GrantStatus.REVOKED.value
+    await db.flush()
+    await cache_delete(f"preview-grant:{grant.id}")
+
+    await record_audit(
+        db,
+        action="preview_grant.revoked",
+        object_type="preview_grant",
+        object_id=grant.id,
+        actor_id=actor.id,
+        before=before,
+        after={"status": GrantStatus.REVOKED.value, "reason": reason},
+        reason=reason,
+        request_id=request_id,
+    )
+    return grant
+
+
+async def revoke_resource_previews(
+    db: AsyncSession,
+    *,
+    actor: "User",
+    resource_id: uuid.UUID,
+    reason: str,
+    request_id: str,
+) -> int:
+    """撤销某资源下所有处于活跃状态的预览凭证（版权下架等场景）。
+
+    不删除凭证记录（保留审计事实），只将状态置为 REVOKED；返回受影响条数。
+    资源不存在时由 content 模块抛 NotFound，避免静默空操作。
+    """
+    if not reason or len(reason.strip()) > 255:
+        raise InvalidInput("撤权理由须为 1–255 字")
+    from app.modules.content.service import get_resource
+
+    await get_resource(db, resource_id)  # 不存在抛 NotFound
+
+    result = await db.execute(
+        update(PreviewGrant)
+        .where(
+            PreviewGrant.resource_id == resource_id,
+            PreviewGrant.status.in_(_REVOKABLE_PREVIEW_STATUSES),
+        )
+        .values(status=GrantStatus.REVOKED.value)
+    )
+    count = int(result.rowcount)
+    await cache_delete(f"preview-resource:{resource_id}")
+    await record_audit(
+        db,
+        action="preview_grant.revoked_resource",
+        object_type="resource",
+        object_id=resource_id,
+        actor_id=actor.id,
+        after={"revoked_count": count, "reason": reason},
+        reason=reason,
+        request_id=request_id,
+    )
+    return count
+
+
+async def issue_inspection_grant(db: AsyncSession, *, user, resource_id, version_id, file_id):
+    """Safe original inspection for the author/review work, never a public distribution grant."""
+    from app.modules.content.service import get_resource, get_version
+    resource = await get_resource(db, resource_id)
+    version = await get_version(db, version_id)
+    if version.resource_id != resource.id or not await _management_bypass(
+        db, user=user, resource=resource, version=version
+    ):
+        raise NotFound("文件不存在")
+    await authorize(db, user=user, resource_id=resource_id, version_id=version_id,
+                    file_id=file_id, capability=Capability.READ_FULL)
+    _, file = await _resolve_file(db, version_id=version_id, file_id=file_id)
+    signed = await storage.presign_download(file.storage_key, bucket=settings.S3_BUCKET_PRIVATE,
+                                           file_name=file.original_name)
+    return {"url": signed.url, "expires_at": signed.expires_at}
 
 
 # --------------------------------------------------------------------------
@@ -245,11 +420,6 @@ async def issue_download_grant(
         "version_id": str(version_id),
         "file_id": str(file_id),
     }
-
-    # 重试：命中同一幂等键且请求摘要一致时返回同一业务授权结果
-    cached = await idem.lookup(db, scope=scope, key=key, payload=payload, actor_id=user.id)
-    if cached is not None:
-        return DownloadGrantResult(**cached)
 
     # 已存在授权记录：在授权许可窗口内重新签发，不自动再次扣额度（§17.2）
     existing = await _grant_by_key(db, user_id=user.id, key=key)
@@ -340,17 +510,53 @@ async def issue_download_grant(
     result = await _sign_download(
         db, grant_id=grant.id, resource_file=resource_file, version_no=version.version_no
     )
-    # 幂等结果与授权在同一事务内提交（§25.1）
-    await idem.remember(
-        db,
-        scope=scope,
-        key=key,
-        payload=payload,
-        actor_id=user.id,
-        response_status=201,
-        response=result.model_dump(mode="json"),
-    )
+    # 下载速率检测（beta14）：只在新授权成功后计一次——授权许可窗口内的重新签发
+    # 是同一授权的链接续签，与配额语义一致不重复计次。
+    await _note_download_velocity(user_id=user.id, request_id=request_id)
+    # DownloadGrant 自身保存幂等事实；不缓存会过期的签名链接。
     return result
+
+
+async def _note_download_velocity(*, user_id: uuid.UUID, request_id: str | None) -> None:
+    """下载速率检测（beta14）：只记录审计标记，不阻断本次下载、不自动冻结。
+
+    冻结属于未定稿政策，这里只做可审计的速率事实：按用户维度用 core.ratelimit 的
+    固定窗口计数（Redis 不可用时回落进程内计数，独立于业务事务，业务回滚不会丢计数，
+    与 comment_reports 频控同一先例），窗口内达到阈值即写
+    `security.download_velocity_flagged` 审计。
+
+    审计写入独立会话并自行提交：调用点在业务事务内，若业务事务随后回滚（如外层
+    请求失败），速率标记必须仍然生效（modules/ratelimit 的独立计数会话先例）。
+    任何异常只记日志：速率检测不得影响一次已经成功的下载授权。
+    """
+    try:
+        allowed = await check_rate_limit(
+            f"download-velocity:{user_id}",
+            limit=settings.DOWNLOAD_VELOCITY_WINDOW_COUNT,
+            window_seconds=settings.DOWNLOAD_VELOCITY_WINDOW_SECONDS,
+        )
+        if allowed:
+            return
+        async with async_session_factory() as session:
+            await record_audit(
+                session,
+                action="security.download_velocity_flagged",
+                object_type="user",
+                object_id=user_id,
+                actor_id=user_id,
+                # 阈值与窗口来自 settings（可调）；精确计数由 ratelimit 计数内部维护。
+                after={
+                    "limit": settings.DOWNLOAD_VELOCITY_WINDOW_COUNT,
+                    "window_seconds": settings.DOWNLOAD_VELOCITY_WINDOW_SECONDS,
+                },
+                reason="下载速率超过阈值（仅标记，未阻断）",
+                request_id=request_id,
+            )
+            await session.commit()
+    except Exception:  # noqa: BLE001 - 速率检测失败不得影响已成功的下载授权
+        logger.exception(
+            "download_velocity_flag_failed", extra={"user_id": str(user_id)}
+        )
 
 
 async def _reissue(
@@ -389,15 +595,6 @@ async def _reissue(
     result = await _sign_download(
         db, grant_id=grant.id, resource_file=resource_file, version_no=version.version_no
     )
-    await idem.remember(
-        db,
-        scope=scope,
-        key=key,
-        payload=payload,
-        actor_id=user.id,
-        response_status=200,
-        response=result.model_dump(mode="json"),
-    )
     return result
 
 
@@ -434,19 +631,10 @@ async def list_entitlements(
     cursor: str | None,
 ) -> CursorPage[EntitlementOut]:
     size = normalize_page_size(limit)
-    stmt = select(Entitlement).order_by(Entitlement.created_at.desc(), Entitlement.id.desc())
+    stmt = select(Entitlement)
     if user_id is not None:
         stmt = stmt.where(Entitlement.user_id == user_id)
-    if cursor:
-        data = decode_cursor(cursor)
-        ts = datetime.fromisoformat(data["ts"])
-        cid = uuid.UUID(data["id"])
-        stmt = stmt.where(
-            or_(
-                Entitlement.created_at < ts,
-                and_(Entitlement.created_at == ts, Entitlement.id < cid),
-            )
-        )
+    stmt = seek_descending(db, stmt, Entitlement.created_at, Entitlement.id, cursor)
     rows = list((await db.execute(stmt.limit(size + 1))).scalars().all())
     has_more = len(rows) > size
     items = rows[:size]
@@ -471,6 +659,28 @@ async def create_entitlement(
     from app.modules.identity.service import get_user
 
     target = await get_user(db, payload.user_id)  # 找不到抛 NotFound
+
+    if target.status in ("banned", "deleted"):
+        raise InvalidInput("不能向已封禁或注销的账号授予权益")
+    if payload.expires_at is not None:
+        now = _now()
+        start = max(_aware(payload.starts_at), now) if payload.starts_at is not None else now
+        if _aware(payload.expires_at) <= start:
+            raise InvalidInput("到期时间必须晚于生效时间和当前时间")
+    from app.modules.content.service import get_resource, get_version
+    from app.modules.catalog.service import get_course
+
+    # 既有权益支持资料、版本或课程；不存在的 UUID 不生成占位权益。
+    found = False
+    for resolve in (get_resource, get_version, get_course):
+        try:
+            await resolve(db, payload.scope_id)
+            found = True
+            break
+        except NotFound:
+            continue
+    if not found:
+        raise NotFound("授权对象不存在")
 
     entitlement = Entitlement(
         user_id=target.id,
@@ -497,7 +707,7 @@ async def create_entitlement(
             "scope_id": str(entitlement.scope_id),
             "capability": entitlement.capability,
             "source_type": entitlement.source_type,
-            "expires_at": entitlement.expires_at,
+            "expires_at": entitlement.expires_at.isoformat() if entitlement.expires_at else None,
         },
         request_id=request_id,
     )
@@ -532,7 +742,7 @@ async def revoke_entitlement(
         object_id=entitlement.id,
         actor_id=actor.id,
         before=before,
-        after={"revoked_at": entitlement.revoked_at, "reason": reason},
+        after={"revoked_at": entitlement.revoked_at.isoformat(), "reason": reason},
         reason=reason,
         request_id=request_id,
     )
@@ -602,11 +812,19 @@ async def get_access_policy(db: AsyncSession, resource_id: uuid.UUID) -> AccessP
     return await _load_policy(db, resource_id)
 
 
+async def initialize_policy(db: AsyncSession, resource_id: uuid.UUID) -> uuid.UUID:
+    """New content starts with explicit model defaults, never implicit public downloads."""
+    policy = AccessPolicy(resource_id=resource_id)
+    db.add(policy)
+    await db.flush()
+    return policy.id
+
+
 # --------------------------------------------------------------------------
 # 内部辅助
 # --------------------------------------------------------------------------
 async def _load_policy(db: AsyncSession, resource_id: uuid.UUID) -> AccessPolicy | None:
-    stmt = select(AccessPolicy).where(AccessPolicy.resource_id == resource_id)
+    stmt = select(AccessPolicy).where(AccessPolicy.resource_id == resource_id).execution_options(populate_existing=True)
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
@@ -640,12 +858,12 @@ async def _management_bypass(
         return True
     if getattr(resource, "owner_id", None) == user.id:
         return True
-    if has_permission(user, RESOURCE_REVIEW):
+    permissions = await effective_permissions(db, user)
+    if RESOURCE_PUBLISH in permissions and version.review_status == "approved":
+        return True
+    if RESOURCE_REVIEW in permissions:
         # 审核员仅在工作范围内可见原件（§15）
-        try:
-            from app.modules.moderation.service import can_review
-        except ImportError:
-            return True
+        from app.modules.moderation.service import can_review
         return bool(await can_review(db, user, version.id))
     return False
 
@@ -705,35 +923,54 @@ async def _rights_basis(db: AsyncSession, version_id: uuid.UUID) -> str | None:
             text(
                 "SELECT rights_basis FROM rights_declarations "
                 "WHERE version_id = :version_id ORDER BY declared_at DESC LIMIT 1"
-            ),
+            ).bindparams(bindparam("version_id", type_=Uuid())),
             {"version_id": version_id},
         )
     ).first()
     return str(row[0]) if row is not None and row[0] is not None else None
 
 
+# 派生产物 → 前端展示形态（prevew.md 五：浏览器拿到的必须是图片而非完整 PDF）。
+_PREVIEW_TYPE_BY_KIND = {
+    DerivativeKind.WATERMARKED_PREVIEW.value: "image",
+    DerivativeKind.PREVIEW_PDF.value: "pdf",
+    DerivativeKind.THUMBNAIL.value: "thumbnail",
+}
+
+
+def _preview_type_of(kind: str) -> str:
+    """派生产物类型映射；未知类型保守按 pdf 处理（维持既有 iframe/链接行为）。"""
+    return _PREVIEW_TYPE_BY_KIND.get(kind, "pdf")
+
+
 async def _find_preview_derivative(
     db: AsyncSession, *, source_file_id: uuid.UUID
-) -> tuple[uuid.UUID, str] | None:
-    """查找已就绪的预览派生产物（§17.1：预览是 FileDerivative，不是另一个内容版本）。
+) -> tuple[uuid.UUID, str, str] | None:
+    """查找已就绪的回退预览派生产物（§17.1：预览是 FileDerivative，不是另一个内容版本）。
 
     跨模块只读：按冻结表名与列名查询，不导入 content 的模型类。
+
+    `watermarked_preview` 不在此查找：它是按用户生成的（prevew.md 十二），
+    由调用方经 `ensure_watermarked_preview` 按当前用户生成/复用，
+    避免把某个用户的水印预览签发给其他用户。
     """
     row = (
         await db.execute(
             text(
-                "SELECT id, storage_key FROM file_derivatives "
+                "SELECT id, storage_key, kind FROM file_derivatives "
                 "WHERE source_file_id = :source_file_id AND status = 'ready' "
-                "AND kind IN ('watermarked_preview', 'preview_pdf') "
-                "ORDER BY CASE kind WHEN 'watermarked_preview' THEN 0 ELSE 1 END, created_at DESC "
+                "AND kind IN ('preview_pdf', 'thumbnail') "
+                "ORDER BY CASE kind WHEN 'preview_pdf' THEN 0 ELSE 1 END, created_at DESC "
                 "LIMIT 1"
-            ),
+            ).bindparams(bindparam("source_file_id", type_=Uuid())),
             {"source_file_id": source_file_id},
         )
     ).first()
     if row is None:
         return None
-    return row[0], str(row[1])
+    # SQLite 的 uuid 列以无连字符字符串存储，裸 SQL 读回是 str；统一成 UUID 对象，
+    # 与 PostgreSQL native uuid 驱动的返回一致，便于后续写入 uuid 列。
+    return uuid.UUID(str(row[0])), str(row[1]), str(row[2])
 
 
 async def _is_school_verified(db: AsyncSession, user: "User") -> bool:

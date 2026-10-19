@@ -11,7 +11,7 @@ import { Search } from 'lucide-react';
 export function SearchBox({
   defaultValue = '',
   size = 'md',
-  placeholder = '输入课程名、课程代码、简称或资料标题',
+  placeholder = '课程名、代码或资料标题',
 }: {
   defaultValue?: string;
   size?: 'md' | 'lg';

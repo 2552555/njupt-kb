@@ -14,8 +14,17 @@ from celery.schedules import schedule
 
 from app.config import settings
 from app.core.enums import JobType
+from app.core.errors import NotEnabled
 
 logger = logging.getLogger("app.worker")
+
+TASK_QUEUES = {
+    JobType.FILE_SCAN: "njupt.scan",
+    JobType.FILE_DERIVE: "njupt.derive",
+    JobType.NOTIFICATION_DISPATCH: "njupt.notify",
+    JobType.EVENT_FANOUT: "njupt.notify",
+    JobType.AI_PROCESS: "njupt.ai",
+}
 
 celery_app = Celery("njupt_kb", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
 
@@ -29,6 +38,7 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
     task_default_queue="njupt",
+    task_routes={kind.value: {"queue": queue} for kind, queue in TASK_QUEUES.items()},
     broker_connection_retry_on_startup=True,
     task_time_limit=settings.DERIVATIVE_TIMEOUT_SECONDS + 120,
     task_soft_time_limit=settings.DERIVATIVE_TIMEOUT_SECONDS + 60,
@@ -40,6 +50,11 @@ celery_app.conf.update(
         },
     },
 )
+
+if settings.RETENTION_SCHEDULE_ENABLED:
+    celery_app.conf.beat_schedule["retention-cleanup"] = {
+        "task": "maintenance.retention", "schedule": schedule(run_every=86400),
+    }
 
 
 def _run(coro):
@@ -86,6 +101,20 @@ def ai_process(self, job_id: str) -> str:
     return _run_job(job_id)
 
 
+async def run_retention_cleanup() -> dict[str, int]:
+    if not settings.RETENTION_SCHEDULE_ENABLED:
+        raise NotEnabled("自动保留期清理未启用")
+    from app.modules.identity.retention import _run as clean_accounts
+    from app.modules.search.retention import _run as clean_search
+
+    return {"accounts": await clean_accounts(), "search_queries": await clean_search()}
+
+
+@celery_app.task(name="maintenance.retention", max_retries=0)
+def retention_cleanup() -> dict[str, int]:
+    return _run(run_retention_cleanup())
+
+
 TASKS_BY_TYPE = {
     JobType.FILE_SCAN: file_scan,
     JobType.FILE_DERIVE: file_derive,
@@ -102,7 +131,7 @@ def submit(job_id: str, job_type: str) -> bool:
         logger.error("unknown_job_type", extra={"job_type": job_type, "job_id": job_id})
         return False
     try:
-        task.apply_async(args=[job_id], queue="njupt")
+        task.apply_async(args=[job_id], queue=TASK_QUEUES[JobType(job_type)])
         return True
     except Exception as exc:  # noqa: BLE001 - 投递失败不抛出，交由扫描器重投
         logger.warning("job_submit_failed", extra={"job_id": job_id, "error": str(exc)})

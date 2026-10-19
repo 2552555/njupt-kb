@@ -6,7 +6,8 @@ import { SkeletonList } from '@/components/ui/Skeleton';
 
 export const metadata: Metadata = {
   title: '搜索',
-  description: '搜索课程资料：按课程名、代码、资料标题或教师姓名查找已发布内容。',
+  description:
+    '统一搜索课程、资料与创作者：按课程名、课程代码、资料标题或创作者显示名查找已发布内容，并可继续按资料类型与年份筛选。',
   // 搜索结果为动态查询，不进入索引（§19.3）。
   robots: { index: false, follow: true },
 };

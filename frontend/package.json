@@ -1,23 +1,27 @@
 {
   "name": "frontend",
-  "version": "0.1.0",
+  "version": "0.0.2",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:protected": "next build && node scripts/obfuscate-selected-chunks.mjs",
+    "obfuscate": "node scripts/obfuscate-selected-chunks.mjs",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "check:artifacts": "node scripts/check-public-artifacts.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",
-    "axios": "^1.18.1",
+    "axios": "1.20.0",
     "date-fns": "^4.4.0",
     "lucide-react": "^1.27.0",
-    "next": "16.2.12",
+    "next": "16.4.2",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "react-dropzone": "^19.1.1",
     "react-hot-toast": "^2.6.0",
+    "server-only": "0.0.1",
     "zustand": "^5.0.14"
   },
   "devDependencies": {
@@ -26,7 +30,10 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.2.12",
+    "eslint-config-next": "16.4.2",
+    "javascript-obfuscator": "^4.1.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

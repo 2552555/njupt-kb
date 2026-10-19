@@ -1,14 +1,17 @@
 'use client';
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import toast from 'react-hot-toast';
 import { Download, Eye, Flag, Heart, Star } from 'lucide-react';
 
 import { Notice } from '@/components/common/Notice';
+import { CoursePicker } from '@/components/catalog/CoursePicker';
+import { RESOURCE_TYPE_LABELS, RESOURCE_TYPE_ORDER, type ResourceType } from '@/lib/api/types';
 import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
-import { createDownloadGrant, createPreviewGrant } from '@/lib/api/access';
+import { Skeleton } from '@/components/ui/Skeleton';
+import { createDownloadGrant, createPreviewGrant, type PreviewGrantResult } from '@/lib/api/access';
 import { describeError } from '@/lib/api/client';
 import type { FileOut } from '@/lib/api/content';
 import {
@@ -17,6 +20,7 @@ import {
   type ReportReasonCode,
 } from '@/lib/api/moderation';
 import {
+  createCorrection,
   ratingSummary,
   removeFavorite,
   setFavorite,
@@ -50,10 +54,10 @@ function newIdempotencyKey(): string {
 export function ResourceActions({
   resourceId,
   versionId,
-  versionNo,
   publicationStatus,
   previewAvailable,
   files,
+  resourceTitle,
 }: {
   resourceId: string;
   versionId: string | null;
@@ -61,6 +65,8 @@ export function ResourceActions({
   publicationStatus: PublicationStatus;
   previewAvailable: boolean;
   files: FileOut[];
+  /** 资料标题：用于第一页图片预览的 alt 文案。 */
+  resourceTitle?: string;
 }) {
   const { status: sessionStatus } = useAuthStore();
   const authed = sessionStatus === 'authenticated';
@@ -68,9 +74,20 @@ export function ResourceActions({
 
   const [pendingFileId, setPendingFileId] = useState<string | null>(null);
   const [previewing, setPreviewing] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewType, setPreviewType] = useState<PreviewGrantResult['preview_type']>('pdf');
+  // 多页预览：逐页 URL；没有 pages 字段时退化为单页。
+  const [previewPages, setPreviewPages] = useState<NonNullable<PreviewGrantResult['pages']>>([]);
+  const [previewPageIndex, setPreviewPageIndex] = useState(0);
+  const [previewImageLoading, setPreviewImageLoading] = useState(false);
+  const [previewImageFailed, setPreviewImageFailed] = useState(false);
+  const downloadKeys = useRef(new Map<string, string>());
   const [favorited, setFavorited] = useState<boolean | null>(null);
   const [favoritePending, setFavoritePending] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
+  const [reportType, setReportType] = useState<'report' | 'correction' | 'classification'>('report');
+  const [suggestedCourse, setSuggestedCourse] = useState('');
+  const [suggestedType, setSuggestedType] = useState<ResourceType | ''>('');
   const [reportReason, setReportReason] = useState<ReportReasonCode>('copyright');
   const [reportDetail, setReportDetail] = useState('');
   const [myScore, setMyScore] = useState<number | null>(null);
@@ -94,17 +111,32 @@ export function ResourceActions({
   });
 
   const reportMutation = useMutation({
-    mutationFn: () =>
-      createReport({
+    mutationFn: () => {
+      if (reportType !== 'report') {
+        if (!versionId) throw new Error('该资料没有可提交纠错的公开版本');
+        if (reportType === 'classification' && !suggestedCourse && !suggestedType) throw new Error('请选择建议课程或资料类型');
+        return createCorrection({
+          resource_id: resourceId,
+          version_id: versionId,
+          description: reportDetail.trim(),
+          suggested_course_id: reportType === 'classification' ? suggestedCourse || undefined : undefined,
+          suggested_resource_type: reportType === 'classification' ? suggestedType || undefined : undefined,
+        }).then(() => 'correction' as const);
+      }
+      return createReport({
         resource_id: resourceId,
         version_id: versionId ?? undefined,
         reason_code: reportReason,
         description: reportDetail.trim() || undefined,
-      }),
-    onSuccess: () => {
+      }).then(() => 'report' as const);
+    },
+    onSuccess: (kind) => {
       setReportOpen(false);
       setReportDetail('');
-      toast.success('举报已提交，会进入独立工单处理');
+      setSuggestedCourse('');
+      setSuggestedType('');
+      toast.success(kind === 'correction' ? '纠错已提交，会进入独立工单处理' : '举报已提交，会进入独立工单处理');
+      queryClient.invalidateQueries({ queryKey: [kind === 'report' ? 'my-reports' : 'my-corrections'] });
     },
     onError: (error) => toast.error(describeError(error).message),
   });
@@ -114,7 +146,22 @@ export function ResourceActions({
     setPreviewing(true);
     try {
       const grant = await createPreviewGrant(resourceId, versionId);
-      window.open(grant.preview_url, '_blank', 'noopener,noreferrer');
+      const pages =
+        grant.pages && grant.pages.length > 0
+          ? grant.pages
+          : [
+              {
+                page_no: 1,
+                url: grant.preview_url,
+                url_expires_at: grant.url_expires_at,
+              },
+            ];
+      setPreviewPages(pages);
+      setPreviewPageIndex(0);
+      setPreviewUrl(pages[0].url);
+      setPreviewType(grant.preview_type ?? 'pdf');
+      setPreviewImageLoading(true);
+      setPreviewImageFailed(false);
       toast.success(`预览链接有效期至 ${formatDateTime(grant.url_expires_at)}`);
     } catch (error) {
       toast.error(describeError(error).message);
@@ -123,20 +170,36 @@ export function ResourceActions({
     }
   }
 
+  function closePreview() {
+    setPreviewUrl(null);
+    setPreviewPages([]);
+    setPreviewPageIndex(0);
+  }
+
+  function goToPreviewPage(next: number) {
+    if (next < 0 || next >= previewPages.length) return;
+    setPreviewPageIndex(next);
+    setPreviewUrl(previewPages[next].url);
+    setPreviewImageLoading(true);
+    setPreviewImageFailed(false);
+  }
+
   async function handleDownload(file: FileOut) {
     if (!versionId) return;
     setPendingFileId(file.id);
+    if (!downloadKeys.current.has(file.id)) downloadKeys.current.set(file.id, newIdempotencyKey());
     try {
       // 幂等键：重试不会重复占用下载额度。
       const grant = await createDownloadGrant(
         resourceId,
         versionId,
         file.id,
-        newIdempotencyKey(),
+        downloadKeys.current.get(file.id)!,
       );
       window.location.assign(grant.download_url);
       toast.success(`已获得下载授权，链接有效期至 ${formatDateTime(grant.url_expires_at)}`);
     } catch (error) {
+      if (describeError(error).code === 'GRANT_WINDOW_EXPIRED') downloadKeys.current.delete(file.id);
       toast.error(describeError(error).message);
     } finally {
       setPendingFileId(null);
@@ -164,86 +227,82 @@ export function ResourceActions({
   }
 
   const summary = ratingQuery.data;
+  const published = publicationStatus === 'published';
 
   return (
     <div className="space-y-6">
+      <Modal isOpen={!!previewUrl} onClose={closePreview} title="资料预览">
+        {previewUrl && (
+          <>
+            {previewType === 'image' ? (
+              previewImageFailed ? (
+                <Notice tone="error" title="预览图片加载失败">
+                  短期链接可能已过期，请关闭后重新点击「查看预览」。
+                </Notice>
+              ) : (
+                <div>
+                  {previewImageLoading && <Skeleton className="h-[65vh] w-full" />}
+                  {/* 多页图片预览：服务端逐页渲染并加水印，浏览器拿到的不是完整 PDF（prevew.md 五）。 */}
+                  {/* Signed private URL must bypass the shared image optimizer. */}
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={previewUrl}
+                    alt={
+                      resourceTitle
+                        ? `${resourceTitle} 第 ${previewPageIndex + 1} 页预览`
+                        : `资料第 ${previewPageIndex + 1} 页预览`
+                    }
+                    onLoad={() => setPreviewImageLoading(false)}
+                    onError={() => {
+                      setPreviewImageLoading(false);
+                      setPreviewImageFailed(true);
+                    }}
+                    className="block max-h-[65vh] w-full object-contain"
+                  />
+                  {previewPages.length > 1 && (
+                    <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-divider pt-3">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => goToPreviewPage(previewPageIndex - 1)}
+                        disabled={previewPageIndex <= 0}
+                      >
+                        上一页
+                      </Button>
+                      <p className="text-sm text-text-secondary">
+                        第 {previewPageIndex + 1} / {previewPages.length} 页（仅提供前 {previewPages.length} 页）
+                      </p>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => goToPreviewPage(previewPageIndex + 1)}
+                        disabled={previewPageIndex >= previewPages.length - 1}
+                      >
+                        下一页
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              )
+            ) : (
+              <iframe src={previewUrl} title="获准访问的资料预览" className="h-[65vh] w-full" />
+            )}
+            <a href={previewUrl} target="_blank" rel="noopener noreferrer" className="mt-3 inline-block underline">在新窗口查看</a>
+          </>
+        )}
+      </Modal>
       {publicationStatus !== 'published' && (
         <Notice tone="warning" title="该资料当前不是已发布状态">
           可能正在审核、已下架或等待处理。此时不能获取新的预览或下载授权。
         </Notice>
       )}
 
-      {/* 文件清单：检查状态以文字 + 颜色共同表达，未通过检查的文件不可下载。 */}
-      <ul className="space-y-3">
-        {files.length === 0 && (
-          <li>
-            <Notice tone="info" title="该版本暂无文件记录">
-              文件可能仍在处理中，稍后再查看。
-            </Notice>
-          </li>
-        )}
-        {files.map((file) => {
-          const scan = scanLabels[file.scan_status] ?? {
-            label: file.scan_status,
-            className: 'bg-steel text-on-color',
-            downloadable: false,
-          };
-          const canDownload = scan.downloadable && authed && !!versionId;
-          return (
-            <li
-              key={file.id}
-              className="flex flex-col gap-3 border border-divider bg-surface p-4 sm:flex-row sm:items-center sm:justify-between"
-            >
-              <div className="min-w-0">
-                <p className="truncate font-medium text-text-primary">{file.original_name}</p>
-                <p className="mt-1 text-xs text-text-secondary">
-                  {purposeLabels[file.purpose] ?? file.purpose} · {formatFileSize(file.size)}
-                  {file.page_count ? ` · ${file.page_count} 页` : ''}
-                </p>
-                <div className="mt-2 flex flex-wrap items-center gap-2">
-                  <span className={`px-2 py-0.5 text-xs font-semibold ${scan.className}`}>
-                    {scan.label}
-                  </span>
-                  {!scan.downloadable && (
-                    <span className="text-xs text-text-secondary">
-                      {file.scan_status === 'pending' || file.scan_status === 'running'
-                        ? '安全检查完成前不能下载，可稍后刷新查看进度。'
-                        : '该文件未通过安全检查，不能下载。'}
-                    </span>
-                  )}
-                </div>
-              </div>
-              <div className="flex shrink-0 flex-wrap gap-2">
-                <Button
-                  variant="secondary"
-                  onClick={() => handleDownload(file)}
-                  isLoading={pendingFileId === file.id}
-                  disabled={!canDownload}
-                >
-                  <Download className="h-4 w-4" aria-hidden="true" />
-                  下载原件
-                </Button>
-              </div>
-            </li>
-          );
-        })}
-      </ul>
-
-      {/* 访问门槛在操作前说明（§26.3）：不把收费/额度留到点击后才发现。 */}
-      <Notice tone="info" title="访问说明">
-        <ul className="space-y-1">
-          <li>· 预览与下载由服务端按访问范围、文件状态与下载额度判定。</li>
-          <li>· 下载需要登录；未获得权益或超出额度时会明确拒绝，不会出现隐含收费。</li>
-          <li>· 已获得的短期链接在有效期内可继续使用；资料下架后不再签发新链接。</li>
-        </ul>
-      </Notice>
-
       <div className="flex flex-wrap gap-2">
         <Button
           variant="primary"
           onClick={handlePreview}
           isLoading={previewing}
-          disabled={!previewAvailable || !versionId}
+          disabled={!previewAvailable || !versionId || !published}
         >
           <Eye className="h-4 w-4" aria-hidden="true" />
           查看预览
@@ -277,6 +336,76 @@ export function ResourceActions({
           举报或纠错
         </Button>
       </div>
+
+
+      {/* 文件清单：检查状态以文字 + 颜色共同表达，未通过检查的文件不可下载。 */}
+      <ul className="space-y-3">
+        {files.length === 0 && (
+          <li>
+            <Notice tone="info" title="该版本暂无文件记录">
+              文件可能仍在处理中，稍后再查看。
+            </Notice>
+          </li>
+        )}
+        {files.map((file) => {
+          const scan = scanLabels[file.scan_status] ?? {
+            label: file.scan_status,
+            className: 'bg-steel text-on-color',
+            downloadable: false,
+          };
+          const canDownload = scan.downloadable && authed && !!versionId && published;
+          return (
+            <li
+              key={file.id}
+              className="flex flex-col gap-3 border border-divider bg-surface p-4 sm:flex-row sm:items-center sm:justify-between"
+            >
+              <div className="min-w-0">
+                <p className="truncate font-medium text-text-primary">{file.original_name}</p>
+                <p className="mt-1 text-xs text-text-secondary">
+                  {purposeLabels[file.purpose] ?? file.purpose} · {formatFileSize(file.size)}
+                  {file.page_count ? ` · ${file.page_count} 页` : ''}
+                </p>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <span className={`px-2 py-0.5 text-xs font-semibold ${scan.className}`}>
+                    {scan.label}
+                  </span>
+                  {!scan.downloadable && (
+                    <span className="text-xs text-text-secondary">
+                      {file.scan_status === 'pending' || file.scan_status === 'running'
+                        ? '安全检查完成前不能下载，可稍后刷新查看进度。'
+                        : '该文件未通过安全检查，不能下载。'}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="flex shrink-0 flex-wrap gap-2">
+                {!authed && published && scan.downloadable ? (
+                  <a href={`/login?next=${encodeURIComponent(`/resources/${resourceId}`)}`} className="inline-flex min-h-11 items-center bg-brand px-4 text-sm text-on-color">登录后下载</a>
+                ) : <Button
+                  variant="secondary"
+                  onClick={() => handleDownload(file)}
+                  isLoading={pendingFileId === file.id}
+                  disabled={!canDownload}
+                >
+                  <Download className="h-4 w-4" aria-hidden="true" />
+                  下载原件
+                </Button>}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+
+      {/* 访问门槛在操作前说明（§26.3）：不把收费/额度留到点击后才发现。 */}
+      <details className="border border-divider bg-surface p-3 text-sm text-text-secondary">
+        <summary className="cursor-pointer font-medium">访问与下载说明</summary>
+        <ul className="space-y-1">
+          <li>· 预览与下载由服务端按访问范围、文件状态与下载额度判定。</li>
+          <li>· 下载需要登录；未获得权益或超出额度时会明确拒绝，不会出现隐含收费。</li>
+          <li>· 已获得的短期链接在有效期内可继续使用；资料下架后不再签发新链接。</li>
+        </ul>
+      </details>
+
 
       {/* 评分：一个用户对同一版本只有一条有效评分，可修改。 */}
       <section aria-labelledby="resource-rating" className="border border-divider bg-surface p-4">
@@ -328,9 +457,6 @@ export function ResourceActions({
         ) : (
           <p className="mt-3 text-sm text-text-secondary">该资料没有可评价的公开版本。</p>
         )}
-        <p className="mt-2 text-xs text-text-secondary">
-          评价资格需先获得该内容的访问权，避免未接触内容的请求影响评分。
-        </p>
       </section>
 
       <Modal isOpen={reportOpen} onClose={() => setReportOpen(false)} title="举报或纠错">
@@ -339,32 +465,57 @@ export function ResourceActions({
           onSubmit={(event) => {
             event.preventDefault();
             if (!authed) {
-              toast.error('登录后才可以举报');
+              toast.error('登录后才可以提交');
+              return;
+            }
+            if (reportType !== 'report' && !reportDetail.trim()) {
+              toast.error('请填写纠错说明');
               return;
             }
             reportMutation.mutate();
           }}
         >
           <div>
-            <label htmlFor="report-reason" className="mb-1 block text-sm font-medium text-text-primary">
-              问题类型
+            <label htmlFor="report-type" className="mb-1 block text-sm font-medium text-text-primary">
+              提交类型
             </label>
             <select
-              id="report-reason"
-              value={reportReason}
-              onChange={(event) => setReportReason(event.target.value as ReportReasonCode)}
+              id="report-type"
+              value={reportType}
+              onChange={(event) => setReportType(event.target.value as typeof reportType)}
               className="min-h-11 w-full border border-control-border bg-surface px-3 text-sm text-text-primary focus:border-brand focus:outline-2 focus:outline-offset-1 focus:outline-focus"
             >
-              {Object.entries(REPORT_REASON_LABELS).map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
+              <option value="report">举报：版权、隐私、安全等问题</option>
+              <option value="correction">纠错：内容错误、缺页、版本不符</option>
+              <option value="classification">分类错误：课程归属或资料类型不符</option>
             </select>
           </div>
+          {reportType === 'classification' && <div className="space-y-3">
+            <CoursePicker label="建议课程（可选）" value={suggestedCourse} onChange={setSuggestedCourse} />
+            <label className="block text-sm">建议资料类型（可选）<select aria-label="建议资料类型" value={suggestedType} onChange={e => setSuggestedType(e.target.value as ResourceType | '')} className="min-h-11 w-full border border-control-border bg-surface px-3"><option value="">不修改资料类型</option>{RESOURCE_TYPE_ORDER.map(type => <option key={type} value={type}>{RESOURCE_TYPE_LABELS[type]}</option>)}</select></label>
+          </div>}
+          {reportType === 'report' && (
+            <div>
+              <label htmlFor="report-reason" className="mb-1 block text-sm font-medium text-text-primary">
+                问题类型
+              </label>
+              <select
+                id="report-reason"
+                value={reportReason}
+                onChange={(event) => setReportReason(event.target.value as ReportReasonCode)}
+                className="min-h-11 w-full border border-control-border bg-surface px-3 text-sm text-text-primary focus:border-brand focus:outline-2 focus:outline-offset-1 focus:outline-focus"
+              >
+                {Object.entries(REPORT_REASON_LABELS).map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <div>
             <label htmlFor="report-detail" className="mb-1 block text-sm font-medium text-text-primary">
-              补充说明（可选）
+              {reportType !== 'report' ? '纠错说明（必填）' : '补充说明（可选）'}
             </label>
             <textarea
               id="report-detail"
@@ -373,7 +524,11 @@ export function ResourceActions({
               rows={4}
               maxLength={2000}
               className="w-full border border-control-border bg-surface px-3 py-2 text-sm text-text-primary focus:border-brand focus:outline-2 focus:outline-offset-1 focus:outline-focus"
-              placeholder="说明你发现的问题，便于处理。"
+              placeholder={
+                reportType === 'correction'
+                  ? '说明错在哪里、正确的是什么；纠错会绑定当前公开版本。'
+                  : '说明你发现的问题，便于处理。'
+              }
             />
           </div>
           <div className="flex justify-end gap-2">

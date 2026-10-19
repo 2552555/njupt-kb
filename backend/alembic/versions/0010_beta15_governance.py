@@ -1,0 +1,271 @@
+"""Beta15 用户权责治理、授权收益与并发硬化（新增 33 张表、两处状态约束与订单快照列）。
+
+依据《课程资料平台用户权责、内容治理与授权收益体系设计文档》v1.0 §3/§13/§15 与
+《高并发 高可用与性能工程专项设计方案》v1.0 §8/§10。
+
+变更范围（全部为增量新增，不改既有列语义、不回填、不改写历史数据）：
+1. 新增 assignment（权限分配、资源分配）、cases（案件与侵权通知）、licensing（协议与定价）、
+   settlement（结算与付款）四个模块的表，以及 creator、commerce 模块 beta15 新增的表；
+2. `resource_versions.review_status` 与 `reviews.status` 的 CHECK 约束增加 `needs_info`
+   （审核补证，用户权责 §14.1/§16.3）；`uq_reviews_active_version` 部分唯一索引口径不变，
+   补证属该轮审核的终态，重投会形成新的审核记录；
+3. `orders` / `order_items` 增加 beta15 快照列（§15.4），全部可空，仅 `refunded_fen`
+   为 NOT NULL DEFAULT 0 以便既有行可直接读取。
+
+`orders.refunded_fen` 使用服务端默认值 0 以兼容既有行；模型侧仍以 Python 默认值为准。
+downgrade 删除本迁移新增的表与列并恢复旧 CHECK 约束，不触碰任何历史业务数据。
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0010_beta15_governance"
+down_revision = "0009_beta13_retention"
+branch_labels = None
+depends_on = None
+
+_NEW_TABLES = [
+    "admin_permission_assignments",
+    "resource_assignments",
+    "cases",
+    "case_events",
+    "case_measures",
+    "rights_notices",
+    "counter_statements",
+    "license_agreements",
+    "agreement_versions",
+    "agreement_acceptances",
+    "price_proposals",
+    "price_acceptances",
+    "revenue_rule_versions",
+    "product_composition_versions",
+    "product_components",
+    "free_license_acceptances",
+    "contributor_applications",
+    "order_item_component_allocations",
+    "order_item_allocations",
+    "grant_components",
+    "refund_items",
+    "refund_component_allocations",
+    "refund_beneficiary_reversals",
+    "ledger_accounts",
+    "ledger_journals",
+    "ledger_lines",
+    "allocation_reservations",
+    "settlement_statements",
+    "settlement_items",
+    "payouts",
+    "payout_attempts",
+    "recovery_claims",
+    "tax_records",]
+_NEW_TABLE_DDL = [
+    "CREATE TABLE admin_permission_assignments (\n\tuser_id UUID NOT NULL, \n\tpermission VARCHAR(64) NOT NULL, \n\tscope VARCHAR(32) NOT NULL, \n\tscope_catalog_id UUID, \n\tscope_resource_id UUID, \n\tvalid_until TIMESTAMP WITH TIME ZONE, \n\tgranted_by UUID, \n\treason TEXT, \n\trevoked_at TIMESTAMP WITH TIME ZONE, \n\trevoked_by UUID, \n\trevoked_reason TEXT, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_admin_permission_assignments PRIMARY KEY (id), \n\tCONSTRAINT ck_admin_permission_assignments_scope_valid CHECK (scope IN ('global', 'catalog', 'resource', 'finance')), \n\tCONSTRAINT uq_admin_permissions_user_permission UNIQUE (user_id, permission), \n\tCONSTRAINT fk_admin_permission_assignments_user_id_users FOREIGN KEY(user_id) REFERENCES users (id), \n\tCONSTRAINT fk_admin_permission_assignments_granted_by_users FOREIGN KEY(granted_by) REFERENCES users (id), \n\tCONSTRAINT fk_admin_permission_assignments_revoked_by_users FOREIGN KEY(revoked_by) REFERENCES users (id)\n)",
+    'CREATE INDEX ix_admin_permission_assignments_created_at ON admin_permission_assignments (created_at)',
+    'CREATE INDEX ix_admin_permission_assignments_user_id ON admin_permission_assignments (user_id)',
+    'CREATE INDEX ix_admin_permissions_user_active ON admin_permission_assignments (user_id, revoked_at)',
+    "CREATE TABLE resource_assignments (\n\tuser_id UUID NOT NULL, \n\tresource_id UUID, \n\tcourse_id UUID, \n\tcapability VARCHAR(32) NOT NULL, \n\teffective_at TIMESTAMP WITH TIME ZONE, \n\tassigned_by UUID, \n\treason TEXT, \n\trevoked_at TIMESTAMP WITH TIME ZONE, \n\trevoked_reason TEXT, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_resource_assignments PRIMARY KEY (id), \n\tCONSTRAINT ck_resource_assignments_capability_valid CHECK (capability IN ('maintain', 'review', 'manage')), \n\tCONSTRAINT ck_resource_assignments_exactly_one_target CHECK ((resource_id IS NOT NULL AND course_id IS NULL) OR (resource_id IS NULL AND course_id IS NOT NULL)), \n\tCONSTRAINT uq_resource_assignments_scope UNIQUE (user_id, resource_id, course_id, capability), \n\tCONSTRAINT fk_resource_assignments_user_id_users FOREIGN KEY(user_id) REFERENCES users (id), \n\tCONSTRAINT fk_resource_assignments_resource_id_resources FOREIGN KEY(resource_id) REFERENCES resources (id), \n\tCONSTRAINT fk_resource_assignments_course_id_courses FOREIGN KEY(course_id) REFERENCES courses (id), \n\tCONSTRAINT fk_resource_assignments_assigned_by_users FOREIGN KEY(assigned_by) REFERENCES users (id)\n)",
+    'CREATE INDEX ix_resource_assignments_course ON resource_assignments (course_id)',
+    'CREATE INDEX ix_resource_assignments_created_at ON resource_assignments (created_at)',
+    'CREATE INDEX ix_resource_assignments_resource ON resource_assignments (resource_id)',
+    'CREATE INDEX ix_resource_assignments_user_active ON resource_assignments (user_id, revoked_at)',
+    'CREATE INDEX ix_resource_assignments_user_id ON resource_assignments (user_id)',
+    "CREATE TABLE cases (\n\tcase_type VARCHAR(32) NOT NULL, \n\tsubject_type VARCHAR(32) NOT NULL, \n\tsubject_id UUID NOT NULL, \n\tapplicant_id UUID NOT NULL, \n\tstate VARCHAR(20) NOT NULL, \n\trule_version VARCHAR(64), \n\thandler_id UUID, \n\ttitle VARCHAR(300) NOT NULL, \n\tdescription TEXT, \n\tdecided_at TIMESTAMP WITH TIME ZONE, \n\tdecision_reason TEXT, \n\tclosed_at TIMESTAMP WITH TIME ZONE, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_cases PRIMARY KEY (id), \n\tCONSTRAINT ck_cases_case_type CHECK (case_type IN ('delivery_dispute', 'revenue_dispute', 'rights_notice', 'general_appeal')), \n\tCONSTRAINT ck_cases_subject_type CHECK (subject_type IN ('resource', 'resource_version', 'comment', 'order', 'order_item', 'other')), \n\tCONSTRAINT ck_cases_state CHECK (state IN ('open', 'triaged', 'investigating', 'decided', 'closed')), \n\tCONSTRAINT fk_cases_applicant_id_users FOREIGN KEY(applicant_id) REFERENCES users (id), \n\tCONSTRAINT fk_cases_handler_id_users FOREIGN KEY(handler_id) REFERENCES users (id)\n)",
+    'CREATE INDEX ix_cases_applicant_id ON cases (applicant_id)',
+    'CREATE INDEX ix_cases_applicant_state ON cases (applicant_id, state)',
+    'CREATE INDEX ix_cases_created_at ON cases (created_at)',
+    'CREATE INDEX ix_cases_handler_id ON cases (handler_id)',
+    'CREATE INDEX ix_cases_subject_id ON cases (subject_id)',
+    'CREATE INDEX ix_cases_type_state ON cases (case_type, state)',
+    "CREATE TABLE case_events (\n\tcase_id UUID NOT NULL, \n\tevent_type VARCHAR(32) NOT NULL, \n\tevidence_ref VARCHAR(512), \n\tserved_at TIMESTAMP WITH TIME ZONE, \n\tdeadline_at TIMESTAMP WITH TIME ZONE, \n\tactor_id UUID, \n\tnote TEXT, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_case_events PRIMARY KEY (id), \n\tCONSTRAINT ck_case_events_event_type CHECK (event_type IN ('submitted', 'triaged', 'forwarded', 'counter_notice', 'measure_taken', 'measure_released', 'decided', 'closed', 'note')), \n\tCONSTRAINT fk_case_events_case_id_cases FOREIGN KEY(case_id) REFERENCES cases (id), \n\tCONSTRAINT fk_case_events_actor_id_users FOREIGN KEY(actor_id) REFERENCES users (id)\n)",
+    'CREATE INDEX ix_case_events_case_created ON case_events (case_id, created_at)',
+    'CREATE INDEX ix_case_events_case_id ON case_events (case_id)',
+    'CREATE INDEX ix_case_events_created_at ON case_events (created_at)',
+    "CREATE TABLE case_measures (\n\tcase_id UUID NOT NULL, \n\ttarget_type VARCHAR(32) NOT NULL, \n\ttarget_id UUID NOT NULL, \n\tmeasure VARCHAR(32) NOT NULL, \n\tstatus VARCHAR(16) NOT NULL, \n\tamount_fen INTEGER, \n\teffective_at TIMESTAMP WITH TIME ZONE, \n\treleased_at TIMESTAMP WITH TIME ZONE, \n\treason TEXT, \n\tactor_id UUID, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_case_measures PRIMARY KEY (id), \n\tCONSTRAINT ck_case_measures_target_type CHECK (target_type IN ('resource', 'resource_version', 'comment', 'order', 'order_item', 'other')), \n\tCONSTRAINT ck_case_measures_measure CHECK (measure IN ('unpublish', 'block_download', 'block_sales', 'restrict_preview', 'freeze_revenue')), \n\tCONSTRAINT ck_case_measures_status CHECK (status IN ('active', 'released')), \n\tCONSTRAINT fk_case_measures_case_id_cases FOREIGN KEY(case_id) REFERENCES cases (id), \n\tCONSTRAINT fk_case_measures_actor_id_users FOREIGN KEY(actor_id) REFERENCES users (id)\n)",
+    'CREATE INDEX ix_case_measures_case ON case_measures (case_id)',
+    'CREATE INDEX ix_case_measures_case_id ON case_measures (case_id)',
+    'CREATE INDEX ix_case_measures_created_at ON case_measures (created_at)',
+    'CREATE INDEX ix_case_measures_target_id ON case_measures (target_id)',
+    'CREATE INDEX ix_case_measures_target_status ON case_measures (target_type, target_id, status)',
+    "CREATE TABLE rights_notices (\n\tcase_id UUID NOT NULL, \n\tclaimant_name VARCHAR(300) NOT NULL, \n\tclaimant_contact VARCHAR(300) NOT NULL, \n\trights_basis_ref VARCHAR(512) NOT NULL, \n\ttarget_type VARCHAR(32) NOT NULL, \n\ttarget_id UUID NOT NULL, \n\trequested_action VARCHAR(300) NOT NULL, \n\tstatement_version VARCHAR(64) NOT NULL, \n\tstatus VARCHAR(20) NOT NULL, \n\treceived_at TIMESTAMP WITH TIME ZONE NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_rights_notices PRIMARY KEY (id), \n\tCONSTRAINT ck_rights_notices_status CHECK (status IN ('received', 'needs_info', 'forwarded', 'counter_received', 'measured', 'closed')), \n\tCONSTRAINT fk_rights_notices_case_id_cases FOREIGN KEY(case_id) REFERENCES cases (id)\n)",
+    'CREATE INDEX ix_rights_notices_case ON rights_notices (case_id)',
+    'CREATE INDEX ix_rights_notices_case_id ON rights_notices (case_id)',
+    'CREATE INDEX ix_rights_notices_created_at ON rights_notices (created_at)',
+    'CREATE INDEX ix_rights_notices_status ON rights_notices (status)',
+    'CREATE INDEX ix_rights_notices_target_id ON rights_notices (target_id)',
+    'CREATE TABLE counter_statements (\n\trights_notice_id UUID NOT NULL, \n\tcase_id UUID NOT NULL, \n\tactor_id UUID NOT NULL, \n\tstatement_text TEXT NOT NULL, \n\tevidence_ref VARCHAR(512), \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_counter_statements PRIMARY KEY (id), \n\tCONSTRAINT fk_counter_statements_rights_notice_id_rights_notices FOREIGN KEY(rights_notice_id) REFERENCES rights_notices (id), \n\tCONSTRAINT fk_counter_statements_case_id_cases FOREIGN KEY(case_id) REFERENCES cases (id), \n\tCONSTRAINT fk_counter_statements_actor_id_users FOREIGN KEY(actor_id) REFERENCES users (id)\n)',
+    'CREATE INDEX ix_counter_statements_case_id ON counter_statements (case_id)',
+    'CREATE INDEX ix_counter_statements_created_at ON counter_statements (created_at)',
+    'CREATE INDEX ix_counter_statements_notice ON counter_statements (rights_notice_id)',
+    'CREATE INDEX ix_counter_statements_rights_notice_id ON counter_statements (rights_notice_id)',
+    "CREATE TABLE license_agreements (\n\tplatform_party_id UUID NOT NULL, \n\tcontributor_party_id UUID NOT NULL, \n\ttitle VARCHAR(300) NOT NULL, \n\tstate VARCHAR(32) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_license_agreements PRIMARY KEY (id), \n\tCONSTRAINT ck_license_agreements_state_valid CHECK (state IN ('draft', 'awaiting_acceptance', 'active', 'suspended', 'expired', 'terminated'))\n)",
+    'CREATE INDEX ix_license_agreements_contributor ON license_agreements (contributor_party_id)',
+    'CREATE INDEX ix_license_agreements_contributor_party_id ON license_agreements (contributor_party_id)',
+    'CREATE INDEX ix_license_agreements_created_at ON license_agreements (created_at)',
+    "CREATE TABLE agreement_versions (\n\tagreement_id UUID NOT NULL, \n\tversion_no INTEGER NOT NULL, \n\tterms_hash VARCHAR(64) NOT NULL, \n\trights_scope JSON NOT NULL, \n\tterritory VARCHAR(120), \n\tstarts_at TIMESTAMP WITH TIME ZONE, \n\tends_at TIMESTAMP WITH TIME ZONE, \n\tstate VARCHAR(32) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_agreement_versions PRIMARY KEY (id), \n\tCONSTRAINT uq_agreement_versions_agreement_version_no UNIQUE (agreement_id, version_no), \n\tCONSTRAINT ck_agreement_versions_state_valid CHECK (state IN ('draft', 'awaiting_acceptance', 'active', 'suspended', 'expired', 'terminated')), \n\tCONSTRAINT fk_agreement_versions_agreement_id_license_agreements FOREIGN KEY(agreement_id) REFERENCES license_agreements (id)\n)",
+    'CREATE INDEX ix_agreement_versions_agreement_created ON agreement_versions (agreement_id, created_at)',
+    'CREATE INDEX ix_agreement_versions_agreement_id ON agreement_versions (agreement_id)',
+    'CREATE INDEX ix_agreement_versions_created_at ON agreement_versions (created_at)',
+    'CREATE TABLE agreement_acceptances (\n\tagreement_version_id UUID NOT NULL, \n\tparty_id UUID NOT NULL, \n\tactor_id UUID NOT NULL, \n\taccepted_hash VARCHAR(64) NOT NULL, \n\tevidence_ref VARCHAR(512), \n\taccepted_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_agreement_acceptances PRIMARY KEY (id), \n\tCONSTRAINT uq_agreement_acceptances_version_party UNIQUE (agreement_version_id, party_id), \n\tCONSTRAINT fk_agreement_acceptances_agreement_version_id_agreement_1f43 FOREIGN KEY(agreement_version_id) REFERENCES agreement_versions (id), \n\tCONSTRAINT fk_agreement_acceptances_actor_id_users FOREIGN KEY(actor_id) REFERENCES users (id)\n)',
+    'CREATE INDEX ix_agreement_acceptances_agreement_version_id ON agreement_acceptances (agreement_version_id)',
+    'CREATE INDEX ix_agreement_acceptances_created_at ON agreement_acceptances (created_at)',
+    'CREATE INDEX ix_agreement_acceptances_party_id ON agreement_acceptances (party_id)',
+    'CREATE INDEX ix_agreement_acceptances_version ON agreement_acceptances (agreement_version_id)',
+    "CREATE TABLE price_proposals (\n\tproduct_id UUID NOT NULL, \n\tversion_no INTEGER NOT NULL, \n\tsuggested_fen INTEGER NOT NULL, \n\tfinal_fen INTEGER, \n\tagreement_version_id UUID, \n\tstate VARCHAR(32) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_price_proposals PRIMARY KEY (id), \n\tCONSTRAINT uq_price_proposals_product_version_no UNIQUE (product_id, version_no), \n\tCONSTRAINT ck_price_proposals_state_valid CHECK (state IN ('proposed', 'negotiating', 'confirmed', 'effective', 'superseded', 'withdrawn')), \n\tCONSTRAINT ck_price_proposals_suggested_fen_positive CHECK (suggested_fen > 0), \n\tCONSTRAINT ck_price_proposals_final_fen_positive CHECK (final_fen IS NULL OR final_fen > 0), \n\tCONSTRAINT fk_price_proposals_product_id_products FOREIGN KEY(product_id) REFERENCES products (id), \n\tCONSTRAINT fk_price_proposals_agreement_version_id_agreement_versions FOREIGN KEY(agreement_version_id) REFERENCES agreement_versions (id)\n)",
+    'CREATE INDEX ix_price_proposals_agreement_version_id ON price_proposals (agreement_version_id)',
+    'CREATE INDEX ix_price_proposals_created_at ON price_proposals (created_at)',
+    'CREATE INDEX ix_price_proposals_product_id ON price_proposals (product_id)',
+    'CREATE INDEX ix_price_proposals_product_state ON price_proposals (product_id, state)',
+    'CREATE TABLE price_acceptances (\n\tproposal_id UUID NOT NULL, \n\tparty_id UUID NOT NULL, \n\taccepted_hash VARCHAR(64) NOT NULL, \n\taccepted_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_price_acceptances PRIMARY KEY (id), \n\tCONSTRAINT uq_price_acceptances_proposal_party UNIQUE (proposal_id, party_id), \n\tCONSTRAINT fk_price_acceptances_proposal_id_price_proposals FOREIGN KEY(proposal_id) REFERENCES price_proposals (id)\n)',
+    'CREATE INDEX ix_price_acceptances_created_at ON price_acceptances (created_at)',
+    'CREATE INDEX ix_price_acceptances_party_id ON price_acceptances (party_id)',
+    'CREATE INDEX ix_price_acceptances_proposal ON price_acceptances (proposal_id)',
+    'CREATE INDEX ix_price_acceptances_proposal_id ON price_acceptances (proposal_id)',
+    'CREATE TABLE revenue_rule_versions (\n\tbase_definition TEXT NOT NULL, \n\tdeductions TEXT, \n\tcreator_bps INTEGER NOT NULL, \n\trounding_policy VARCHAR(64) NOT NULL, \n\tmaturity_policy VARCHAR(64) NOT NULL, \n\tversion_no INTEGER NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_revenue_rule_versions PRIMARY KEY (id), \n\tCONSTRAINT uq_revenue_rule_versions_version_no UNIQUE (version_no), \n\tCONSTRAINT ck_revenue_rule_versions_creator_bps_range CHECK (creator_bps >= 0 AND creator_bps <= 10000)\n)',
+    'CREATE INDEX ix_revenue_rule_versions_created_at ON revenue_rule_versions (created_at)',
+    "CREATE TABLE product_composition_versions (\n\tproduct_id UUID NOT NULL, \n\tversion_no INTEGER NOT NULL, \n\tstate VARCHAR(32) NOT NULL, \n\tmanifest_hash VARCHAR(64) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_product_composition_versions PRIMARY KEY (id), \n\tCONSTRAINT uq_product_composition_versions_product_version_no UNIQUE (product_id, version_no), \n\tCONSTRAINT ck_product_composition_versions_state_valid CHECK (state IN ('frozen', 'superseded')), \n\tCONSTRAINT fk_product_composition_versions_product_id_products FOREIGN KEY(product_id) REFERENCES products (id)\n)",
+    'CREATE INDEX ix_product_composition_versions_created_at ON product_composition_versions (created_at)',
+    'CREATE INDEX ix_product_composition_versions_product ON product_composition_versions (product_id)',
+    'CREATE INDEX ix_product_composition_versions_product_id ON product_composition_versions (product_id)',
+    'CREATE TABLE product_components (\n\tcomposition_version_id UUID NOT NULL, \n\tresource_version_id UUID, \n\tasset_version_id UUID, \n\tagreement_version_id UUID, \n\tweight NUMERIC(18, 4) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_product_components PRIMARY KEY (id), \n\tCONSTRAINT uq_product_components_component UNIQUE (composition_version_id, resource_version_id, asset_version_id), \n\tCONSTRAINT ck_product_components_weight_non_negative CHECK (weight >= 0), \n\tCONSTRAINT fk_product_components_composition_version_id_product_co_5a9f FOREIGN KEY(composition_version_id) REFERENCES product_composition_versions (id), \n\tCONSTRAINT fk_product_components_resource_version_id_resource_versions FOREIGN KEY(resource_version_id) REFERENCES resource_versions (id), \n\tCONSTRAINT fk_product_components_agreement_version_id_agreement_versions FOREIGN KEY(agreement_version_id) REFERENCES agreement_versions (id)\n)',
+    'CREATE INDEX ix_product_components_agreement_version_id ON product_components (agreement_version_id)',
+    'CREATE INDEX ix_product_components_composition ON product_components (composition_version_id)',
+    'CREATE INDEX ix_product_components_composition_version_id ON product_components (composition_version_id)',
+    'CREATE INDEX ix_product_components_created_at ON product_components (created_at)',
+    'CREATE INDEX ix_product_components_resource_version_id ON product_components (resource_version_id)',
+    'CREATE TABLE free_license_acceptances (\n\trevision_id UUID NOT NULL, \n\tlicense_version VARCHAR(64) NOT NULL, \n\tactor_id UUID NOT NULL, \n\taccepted_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_free_license_acceptances PRIMARY KEY (id), \n\tCONSTRAINT uq_free_license_acceptances_revision_license UNIQUE (revision_id, license_version), \n\tCONSTRAINT fk_free_license_acceptances_revision_id_resource_versions FOREIGN KEY(revision_id) REFERENCES resource_versions (id), \n\tCONSTRAINT fk_free_license_acceptances_actor_id_users FOREIGN KEY(actor_id) REFERENCES users (id)\n)',
+    'CREATE INDEX ix_free_license_acceptances_created_at ON free_license_acceptances (created_at)',
+    'CREATE INDEX ix_free_license_acceptances_revision ON free_license_acceptances (revision_id)',
+    'CREATE INDEX ix_free_license_acceptances_revision_id ON free_license_acceptances (revision_id)',
+    "CREATE TABLE contributor_applications (\n\tuser_id UUID NOT NULL, \n\tstatus VARCHAR(20) NOT NULL, \n\tcapability_summary TEXT NOT NULL, \n\trights_materials_ref VARCHAR(512) NOT NULL, \n\tverification_ref VARCHAR(512), \n\tcontract_party_ref VARCHAR(512), \n\tsubmitted_at TIMESTAMP WITH TIME ZONE NOT NULL, \n\tdecided_at TIMESTAMP WITH TIME ZONE, \n\tdecided_by UUID, \n\tdecision_reason VARCHAR(255), \n\tclosed_at TIMESTAMP WITH TIME ZONE, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_contributor_applications PRIMARY KEY (id), \n\tCONSTRAINT ck_contributor_applications_status_valid CHECK (status IN ('applied', 'under_review', 'active', 'rejected', 'suspended', 'exited')), \n\tCONSTRAINT fk_contributor_applications_user_id_users FOREIGN KEY(user_id) REFERENCES users (id), \n\tCONSTRAINT fk_contributor_applications_decided_by_users FOREIGN KEY(decided_by) REFERENCES users (id)\n)",
+    'CREATE INDEX ix_contributor_applications_created_at ON contributor_applications (created_at)',
+    'CREATE INDEX ix_contributor_applications_user_status ON contributor_applications (user_id, status)',
+    'CREATE TABLE order_item_component_allocations (\n\torder_item_id UUID NOT NULL, \n\tcomponent_key VARCHAR(120) NOT NULL, \n\tallocated_fen INTEGER NOT NULL, \n\tbase_fen INTEGER NOT NULL, \n\tdeduction_fen INTEGER NOT NULL, \n\tcreator_total_fen INTEGER NOT NULL, \n\tplatform_fen INTEGER NOT NULL, \n\trule_snapshot JSONB, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_order_item_component_allocations PRIMARY KEY (id), \n\tCONSTRAINT uq_oica_order_item_component UNIQUE (order_item_id, component_key), \n\tCONSTRAINT ck_order_item_component_allocations_allocated_non_negative CHECK (allocated_fen >= 0), \n\tCONSTRAINT ck_order_item_component_allocations_base_non_negative CHECK (base_fen >= 0), \n\tCONSTRAINT ck_order_item_component_allocations_deduction_non_negative CHECK (deduction_fen >= 0), \n\tCONSTRAINT ck_order_item_component_allocations_creator_total_non_negative CHECK (creator_total_fen >= 0), \n\tCONSTRAINT ck_order_item_component_allocations_platform_non_negative CHECK (platform_fen >= 0), \n\tCONSTRAINT fk_order_item_component_allocations_order_item_id_order_items FOREIGN KEY(order_item_id) REFERENCES order_items (id)\n)',
+    'CREATE INDEX ix_oica_order_item ON order_item_component_allocations (order_item_id)',
+    'CREATE INDEX ix_order_item_component_allocations_created_at ON order_item_component_allocations (created_at)',
+    'CREATE INDEX ix_order_item_component_allocations_order_item_id ON order_item_component_allocations (order_item_id)',
+    'CREATE TABLE order_item_allocations (\n\tcomponent_allocation_id UUID NOT NULL, \n\tbeneficiary_party_id UUID NOT NULL, \n\tagreement_version_id UUID, \n\tcreator_fen INTEGER NOT NULL, \n\tshare_snapshot JSONB, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_order_item_allocations PRIMARY KEY (id), \n\tCONSTRAINT uq_oia_component_beneficiary UNIQUE (component_allocation_id, beneficiary_party_id), \n\tCONSTRAINT ck_order_item_allocations_creator_non_negative CHECK (creator_fen >= 0), \n\tCONSTRAINT fk_order_item_allocations_component_allocation_id_order_ca08 FOREIGN KEY(component_allocation_id) REFERENCES order_item_component_allocations (id)\n)',
+    'CREATE INDEX ix_oia_beneficiary ON order_item_allocations (beneficiary_party_id)',
+    'CREATE INDEX ix_oia_component ON order_item_allocations (component_allocation_id)',
+    'CREATE INDEX ix_order_item_allocations_beneficiary_party_id ON order_item_allocations (beneficiary_party_id)',
+    'CREATE INDEX ix_order_item_allocations_component_allocation_id ON order_item_allocations (component_allocation_id)',
+    'CREATE INDEX ix_order_item_allocations_created_at ON order_item_allocations (created_at)',
+    "CREATE TABLE grant_components (\n\tgrant_id UUID NOT NULL, \n\tasset_version_id UUID, \n\tcourse_component_id UUID, \n\tstatus VARCHAR(32) NOT NULL, \n\tsource_component_key VARCHAR(120) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_grant_components PRIMARY KEY (id), \n\tCONSTRAINT uq_grant_components_grant_component UNIQUE (grant_id, source_component_key), \n\tCONSTRAINT ck_grant_components_status_valid CHECK (status IN ('issued', 'consumed', 'expired', 'revoked')), \n\tCONSTRAINT fk_grant_components_grant_id_entitlements FOREIGN KEY(grant_id) REFERENCES entitlements (id)\n)",
+    'CREATE INDEX ix_grant_components_created_at ON grant_components (created_at)',
+    'CREATE INDEX ix_grant_components_grant ON grant_components (grant_id)',
+    'CREATE INDEX ix_grant_components_grant_id ON grant_components (grant_id)',
+    'CREATE TABLE refund_items (\n\trefund_id UUID NOT NULL, \n\torder_item_id UUID NOT NULL, \n\tamount_fen INTEGER NOT NULL, \n\trequested_fen INTEGER NOT NULL, \n\tsucceeded_fen INTEGER NOT NULL, \n\tentitlement_action VARCHAR(32), \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_refund_items PRIMARY KEY (id), \n\tCONSTRAINT uq_refund_items_refund_item UNIQUE (refund_id, order_item_id), \n\tCONSTRAINT ck_refund_items_amount_non_negative CHECK (amount_fen >= 0), \n\tCONSTRAINT ck_refund_items_requested_non_negative CHECK (requested_fen >= 0), \n\tCONSTRAINT ck_refund_items_succeeded_non_negative CHECK (succeeded_fen >= 0), \n\tCONSTRAINT fk_refund_items_refund_id_refunds FOREIGN KEY(refund_id) REFERENCES refunds (id), \n\tCONSTRAINT fk_refund_items_order_item_id_order_items FOREIGN KEY(order_item_id) REFERENCES order_items (id)\n)',
+    'CREATE INDEX ix_refund_items_created_at ON refund_items (created_at)',
+    'CREATE INDEX ix_refund_items_order_item ON refund_items (order_item_id)',
+    'CREATE INDEX ix_refund_items_order_item_id ON refund_items (order_item_id)',
+    'CREATE INDEX ix_refund_items_refund ON refund_items (refund_id)',
+    'CREATE INDEX ix_refund_items_refund_id ON refund_items (refund_id)',
+    'CREATE TABLE refund_component_allocations (\n\trefund_item_id UUID NOT NULL, \n\tcomponent_allocation_id UUID NOT NULL, \n\tbase_reduction_fen INTEGER NOT NULL, \n\tcreator_total_reversal_fen INTEGER NOT NULL, \n\tplatform_reversal_fen INTEGER NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_refund_component_allocations PRIMARY KEY (id), \n\tCONSTRAINT uq_rca_refund_item_component UNIQUE (refund_item_id, component_allocation_id), \n\tCONSTRAINT ck_refund_component_allocations_base_reduction_non_negative CHECK (base_reduction_fen >= 0), \n\tCONSTRAINT ck_refund_component_allocations_creator_reversal_non_negative CHECK (creator_total_reversal_fen >= 0), \n\tCONSTRAINT ck_refund_component_allocations_platform_reversal_non_negative CHECK (platform_reversal_fen >= 0), \n\tCONSTRAINT fk_refund_component_allocations_refund_item_id_refund_items FOREIGN KEY(refund_item_id) REFERENCES refund_items (id), \n\tCONSTRAINT fk_refund_component_allocations_component_allocation_id_6685 FOREIGN KEY(component_allocation_id) REFERENCES order_item_component_allocations (id)\n)',
+    'CREATE INDEX ix_rca_component ON refund_component_allocations (component_allocation_id)',
+    'CREATE INDEX ix_refund_component_allocations_component_allocation_id ON refund_component_allocations (component_allocation_id)',
+    'CREATE INDEX ix_refund_component_allocations_created_at ON refund_component_allocations (created_at)',
+    'CREATE INDEX ix_refund_component_allocations_refund_item_id ON refund_component_allocations (refund_item_id)',
+    'CREATE TABLE refund_beneficiary_reversals (\n\trefund_component_allocation_id UUID NOT NULL, \n\tallocation_id UUID NOT NULL, \n\tcreator_reversal_fen INTEGER NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_refund_beneficiary_reversals PRIMARY KEY (id), \n\tCONSTRAINT uq_rbr_component_allocation UNIQUE (refund_component_allocation_id, allocation_id), \n\tCONSTRAINT ck_refund_beneficiary_reversals_creator_reversal_non_negative CHECK (creator_reversal_fen >= 0), \n\tCONSTRAINT fk_refund_beneficiary_reversals_refund_component_alloca_872f FOREIGN KEY(refund_component_allocation_id) REFERENCES refund_component_allocations (id), \n\tCONSTRAINT fk_refund_beneficiary_reversals_allocation_id_order_ite_6c80 FOREIGN KEY(allocation_id) REFERENCES order_item_allocations (id)\n)',
+    'CREATE INDEX ix_rbr_allocation ON refund_beneficiary_reversals (allocation_id)',
+    'CREATE INDEX ix_refund_beneficiary_reversals_allocation_id ON refund_beneficiary_reversals (allocation_id)',
+    'CREATE INDEX ix_refund_beneficiary_reversals_created_at ON refund_beneficiary_reversals (created_at)',
+    'CREATE INDEX ix_refund_beneficiary_reversals_refund_component_allocation_id ON refund_beneficiary_reversals (refund_component_allocation_id)',
+    "CREATE TABLE ledger_accounts (\n\tparty_id UUID, \n\tcurrency VARCHAR(3) NOT NULL, \n\tbucket VARCHAR(32) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_ledger_accounts PRIMARY KEY (id), \n\tCONSTRAINT uq_ledger_accounts_party_currency_bucket UNIQUE (party_id, currency, bucket), \n\tCONSTRAINT ck_ledger_accounts_bucket_valid CHECK (bucket IN ('pending', 'available', 'frozen', 'locked', 'paid', 'reversed'))\n)",
+    'CREATE INDEX ix_ledger_accounts_created_at ON ledger_accounts (created_at)',
+    'CREATE INDEX ix_ledger_accounts_party_id ON ledger_accounts (party_id)',
+    "CREATE TABLE ledger_journals (\n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tevent_key VARCHAR(200) NOT NULL, \n\tevent_type VARCHAR(32) NOT NULL, \n\tsource_id UUID, \n\treverses_id UUID, \n\toccurred_at TIMESTAMP WITH TIME ZONE, \n\trecorded_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tid UUID NOT NULL, \n\tCONSTRAINT pk_ledger_journals PRIMARY KEY (id), \n\tCONSTRAINT ck_ledger_journals_event_type_valid CHECK (event_type IN ('order_accrual', 'refund_reversal', 'freeze', 'release', 'settlement_lock', 'payout', 'correction')), \n\tCONSTRAINT uq_ledger_journals_event_key UNIQUE (event_key), \n\tCONSTRAINT fk_ledger_journals_reverses_id_ledger_journals FOREIGN KEY(reverses_id) REFERENCES ledger_journals (id)\n)",
+    'CREATE INDEX ix_ledger_journals_created_at ON ledger_journals (created_at)',
+    'CREATE INDEX ix_ledger_journals_source ON ledger_journals (source_id)',
+    'CREATE INDEX ix_ledger_journals_source_id ON ledger_journals (source_id)',
+    'CREATE TABLE ledger_lines (\n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tjournal_id UUID NOT NULL, \n\taccount_id UUID NOT NULL, \n\tallocation_id UUID, \n\tdebit_fen INTEGER NOT NULL, \n\tcredit_fen INTEGER NOT NULL, \n\tid UUID NOT NULL, \n\tCONSTRAINT pk_ledger_lines PRIMARY KEY (id), \n\tCONSTRAINT ck_ledger_lines_debit_non_negative CHECK (debit_fen >= 0), \n\tCONSTRAINT ck_ledger_lines_credit_non_negative CHECK (credit_fen >= 0), \n\tCONSTRAINT ck_ledger_lines_direction_exclusive CHECK ((debit_fen > 0 AND credit_fen = 0) OR (credit_fen > 0 AND debit_fen = 0)), \n\tCONSTRAINT fk_ledger_lines_journal_id_ledger_journals FOREIGN KEY(journal_id) REFERENCES ledger_journals (id), \n\tCONSTRAINT fk_ledger_lines_account_id_ledger_accounts FOREIGN KEY(account_id) REFERENCES ledger_accounts (id), \n\tCONSTRAINT fk_ledger_lines_allocation_id_order_item_allocations FOREIGN KEY(allocation_id) REFERENCES order_item_allocations (id)\n)',
+    'CREATE INDEX ix_ledger_lines_account ON ledger_lines (account_id)',
+    'CREATE INDEX ix_ledger_lines_account_id ON ledger_lines (account_id)',
+    'CREATE INDEX ix_ledger_lines_created_at ON ledger_lines (created_at)',
+    'CREATE INDEX ix_ledger_lines_journal ON ledger_lines (journal_id)',
+    'CREATE INDEX ix_ledger_lines_journal_id ON ledger_lines (journal_id)',
+    'CREATE TABLE allocation_reservations (\n\tallocation_id UUID NOT NULL, \n\tsource_type VARCHAR(32) NOT NULL, \n\tsource_id UUID NOT NULL, \n\tamount_fen INTEGER NOT NULL, \n\tstate VARCHAR(32) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_allocation_reservations PRIMARY KEY (id), \n\tCONSTRAINT uq_alloc_reservations_source UNIQUE (allocation_id, source_type, source_id), \n\tCONSTRAINT ck_allocation_reservations_amount_positive CHECK (amount_fen > 0), \n\tCONSTRAINT fk_allocation_reservations_allocation_id_order_item_allocations FOREIGN KEY(allocation_id) REFERENCES order_item_allocations (id)\n)',
+    'CREATE INDEX ix_alloc_reservations_allocation ON allocation_reservations (allocation_id)',
+    'CREATE INDEX ix_allocation_reservations_allocation_id ON allocation_reservations (allocation_id)',
+    'CREATE INDEX ix_allocation_reservations_created_at ON allocation_reservations (created_at)',
+    'CREATE INDEX ix_allocation_reservations_source_id ON allocation_reservations (source_id)',
+    "CREATE TABLE settlement_statements (\n\tpayee_party_id UUID NOT NULL, \n\tperiod VARCHAR(32) NOT NULL, \n\tcurrency VARCHAR(3) NOT NULL, \n\tversion INTEGER NOT NULL, \n\tstate VARCHAR(32) NOT NULL, \n\tgross_fen INTEGER NOT NULL, \n\ttax_fen INTEGER NOT NULL, \n\tnet_fen INTEGER NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_settlement_statements PRIMARY KEY (id), \n\tCONSTRAINT uq_settlement_statements_payee_period_currency_version UNIQUE (payee_party_id, period, currency, version), \n\tCONSTRAINT ck_settlement_statements_state_valid CHECK (state IN ('draft', 'awaiting_confirmation', 'confirmed', 'approved', 'payment_pending', 'paid', 'disputed')), \n\tCONSTRAINT ck_settlement_statements_gross_fen_non_negative CHECK (gross_fen >= 0), \n\tCONSTRAINT ck_settlement_statements_tax_fen_non_negative CHECK (tax_fen >= 0), \n\tCONSTRAINT ck_settlement_statements_net_fen_non_negative CHECK (net_fen >= 0), \n\tCONSTRAINT ck_settlement_statements_version_positive CHECK (version >= 1)\n)",
+    'CREATE INDEX ix_settlement_statements_created_at ON settlement_statements (created_at)',
+    'CREATE INDEX ix_settlement_statements_payee_party_id ON settlement_statements (payee_party_id)',
+    'CREATE INDEX ix_settlement_statements_payee_state ON settlement_statements (payee_party_id, state)',
+    'CREATE TABLE settlement_items (\n\tstatement_id UUID NOT NULL, \n\tallocation_id UUID NOT NULL, \n\tamount_fen INTEGER NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_settlement_items PRIMARY KEY (id), \n\tCONSTRAINT uq_settlement_items_statement_allocation UNIQUE (statement_id, allocation_id), \n\tCONSTRAINT ck_settlement_items_amount_fen_positive CHECK (amount_fen > 0), \n\tCONSTRAINT fk_settlement_items_statement_id_settlement_statements FOREIGN KEY(statement_id) REFERENCES settlement_statements (id), \n\tCONSTRAINT fk_settlement_items_allocation_id_order_item_allocations FOREIGN KEY(allocation_id) REFERENCES order_item_allocations (id)\n)',
+    'CREATE INDEX ix_settlement_items_allocation ON settlement_items (allocation_id)',
+    'CREATE INDEX ix_settlement_items_allocation_id ON settlement_items (allocation_id)',
+    'CREATE INDEX ix_settlement_items_created_at ON settlement_items (created_at)',
+    'CREATE INDEX ix_settlement_items_statement ON settlement_items (statement_id)',
+    'CREATE INDEX ix_settlement_items_statement_id ON settlement_items (statement_id)',
+    "CREATE TABLE payouts (\n\tstatement_version_id UUID NOT NULL, \n\tpayee_snapshot JSONB NOT NULL, \n\tamount_fen INTEGER NOT NULL, \n\tstate VARCHAR(32) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_payouts PRIMARY KEY (id), \n\tCONSTRAINT uq_payouts_statement_version UNIQUE (statement_version_id), \n\tCONSTRAINT ck_payouts_state_valid CHECK (state IN ('created', 'processing', 'succeeded', 'failed', 'uncertain')), \n\tCONSTRAINT ck_payouts_amount_fen_non_negative CHECK (amount_fen >= 0), \n\tCONSTRAINT fk_payouts_statement_version_id_settlement_statements FOREIGN KEY(statement_version_id) REFERENCES settlement_statements (id)\n)",
+    'CREATE INDEX ix_payouts_created_at ON payouts (created_at)',
+    'CREATE INDEX ix_payouts_state ON payouts (state)',
+    'CREATE INDEX ix_payouts_statement_version_id ON payouts (statement_version_id)',
+    "CREATE TABLE payout_attempts (\n\tpayout_id UUID NOT NULL, \n\tattempt_no INTEGER NOT NULL, \n\tstate VARCHAR(32) NOT NULL, \n\texternal_ref_key VARCHAR(200), \n\tevidence_ref VARCHAR(512), \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_payout_attempts PRIMARY KEY (id), \n\tCONSTRAINT uq_payout_attempts_payout_attempt_no UNIQUE (payout_id, attempt_no), \n\tCONSTRAINT uq_payout_attempts_external_ref_key UNIQUE (external_ref_key), \n\tCONSTRAINT ck_payout_attempts_state_valid CHECK (state IN ('created', 'processing', 'succeeded', 'failed', 'uncertain')), \n\tCONSTRAINT ck_payout_attempts_attempt_no_positive CHECK (attempt_no >= 1), \n\tCONSTRAINT fk_payout_attempts_payout_id_payouts FOREIGN KEY(payout_id) REFERENCES payouts (id)\n)",
+    'CREATE INDEX ix_payout_attempts_created_at ON payout_attempts (created_at)',
+    'CREATE INDEX ix_payout_attempts_payout ON payout_attempts (payout_id)',
+    'CREATE INDEX ix_payout_attempts_payout_id ON payout_attempts (payout_id)',
+    "CREATE TABLE recovery_claims (\n\tallocation_id UUID NOT NULL, \n\trefund_id UUID NOT NULL, \n\tpaid_reference VARCHAR(200), \n\tamount_fen INTEGER NOT NULL, \n\tlegal_basis_ref TEXT NOT NULL, \n\tstate VARCHAR(32) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_recovery_claims PRIMARY KEY (id), \n\tCONSTRAINT uq_recovery_claims_allocation_refund UNIQUE (allocation_id, refund_id), \n\tCONSTRAINT ck_recovery_claims_state_valid CHECK (state IN ('open', 'recovered', 'waived')), \n\tCONSTRAINT ck_recovery_claims_amount_fen_positive CHECK (amount_fen > 0), \n\tCONSTRAINT fk_recovery_claims_allocation_id_order_item_allocations FOREIGN KEY(allocation_id) REFERENCES order_item_allocations (id), \n\tCONSTRAINT fk_recovery_claims_refund_id_refunds FOREIGN KEY(refund_id) REFERENCES refunds (id)\n)",
+    'CREATE INDEX ix_recovery_claims_allocation ON recovery_claims (allocation_id)',
+    'CREATE INDEX ix_recovery_claims_allocation_id ON recovery_claims (allocation_id)',
+    'CREATE INDEX ix_recovery_claims_created_at ON recovery_claims (created_at)',
+    'CREATE INDEX ix_recovery_claims_refund ON recovery_claims (refund_id)',
+    'CREATE INDEX ix_recovery_claims_refund_id ON recovery_claims (refund_id)',
+    "CREATE TABLE tax_records (\n\tparty_id UUID NOT NULL, \n\tstatement_id UUID, \n\ttax_type VARCHAR(60) NOT NULL, \n\tamount_fen INTEGER NOT NULL, \n\tevidence_ref VARCHAR(512), \n\tstate VARCHAR(32) NOT NULL, \n\tid UUID NOT NULL, \n\tcreated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tupdated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, \n\tCONSTRAINT pk_tax_records PRIMARY KEY (id), \n\tCONSTRAINT ck_tax_records_state_valid CHECK (state IN ('pending', 'paid', 'void')), \n\tCONSTRAINT ck_tax_records_amount_fen_non_negative CHECK (amount_fen >= 0), \n\tCONSTRAINT fk_tax_records_statement_id_settlement_statements FOREIGN KEY(statement_id) REFERENCES settlement_statements (id)\n)",
+    'CREATE INDEX ix_tax_records_created_at ON tax_records (created_at)',
+    'CREATE INDEX ix_tax_records_party ON tax_records (party_id)',
+    'CREATE INDEX ix_tax_records_party_id ON tax_records (party_id)',
+    'CREATE INDEX ix_tax_records_statement ON tax_records (statement_id)',
+    'CREATE INDEX ix_tax_records_statement_id ON tax_records (statement_id)',
+]
+
+
+_UPGRADE_DDL = [
+    'ALTER TABLE orders ADD COLUMN refund_capability_version VARCHAR(60)',
+    'ALTER TABLE orders ADD COLUMN refunded_fen INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE order_items ADD COLUMN seller_party_id UUID',
+    'ALTER TABLE order_items ADD COLUMN contract_model VARCHAR(32)',
+    'ALTER TABLE order_items ADD COLUMN agreement_snapshot JSONB',
+    'ALTER TABLE order_items ADD COLUMN price_snapshot JSONB',
+    'ALTER TABLE order_items ADD COLUMN revenue_snapshot JSONB',
+    'ALTER TABLE order_items ADD COLUMN composition_snapshot JSONB',
+    'ALTER TABLE order_items ADD COLUMN refund_capability_version VARCHAR(60)',
+    'CREATE INDEX ix_order_items_seller_party_id ON order_items (seller_party_id)',
+    'ALTER TABLE resource_versions DROP CONSTRAINT IF EXISTS ck_resource_versions_review_status',
+    "ALTER TABLE resource_versions ADD CONSTRAINT ck_resource_versions_review_status CHECK (review_status IN ('draft', 'pending', 'needs_info', 'approved', 'rejected'))",
+    'ALTER TABLE reviews DROP CONSTRAINT IF EXISTS ck_reviews_status_valid',
+    "ALTER TABLE reviews ADD CONSTRAINT ck_reviews_status_valid CHECK (status IN ('draft', 'pending', 'needs_info', 'approved', 'rejected'))",
+]
+
+
+_DOWNGRADE_DDL = [
+    'ALTER TABLE reviews DROP CONSTRAINT IF EXISTS ck_reviews_status_valid',
+    "ALTER TABLE reviews ADD CONSTRAINT ck_reviews_status_valid CHECK (status IN ('draft', 'pending', 'approved', 'rejected'))",
+    'ALTER TABLE resource_versions DROP CONSTRAINT IF EXISTS ck_resource_versions_review_status',
+    "ALTER TABLE resource_versions ADD CONSTRAINT ck_resource_versions_review_status CHECK (review_status IN ('draft', 'pending', 'approved', 'rejected'))",
+    'DROP INDEX IF EXISTS ix_order_items_seller_party_id',
+    'ALTER TABLE order_items DROP COLUMN IF EXISTS refund_capability_version',
+    'ALTER TABLE order_items DROP COLUMN IF EXISTS composition_snapshot',
+    'ALTER TABLE order_items DROP COLUMN IF EXISTS revenue_snapshot',
+    'ALTER TABLE order_items DROP COLUMN IF EXISTS price_snapshot',
+    'ALTER TABLE order_items DROP COLUMN IF EXISTS agreement_snapshot',
+    'ALTER TABLE order_items DROP COLUMN IF EXISTS contract_model',
+    'ALTER TABLE order_items DROP COLUMN IF EXISTS seller_party_id',
+    'ALTER TABLE orders DROP COLUMN IF EXISTS refunded_fen',
+    'ALTER TABLE orders DROP COLUMN IF EXISTS refund_capability_version',
+
+]
+
+
+def upgrade() -> None:
+    for ddl in _NEW_TABLE_DDL:
+        op.execute(sa.text(ddl))
+    for ddl in _UPGRADE_DDL:
+        op.execute(sa.text(ddl))
+
+
+def downgrade() -> None:
+    for ddl in _DOWNGRADE_DDL:
+        op.execute(sa.text(ddl))
+    for name in reversed(_NEW_TABLES):
+        op.execute(sa.text(f"DROP TABLE IF EXISTS {name} CASCADE"))

@@ -5,6 +5,7 @@
  */
 @import "tailwindcss";
 @import "../styles/tokens.css";
+@import "../styles/motion.css";
 
 /* 显式声明扫描范围：src 下的全部 TS/TSX（组件与页面），避免自动探测遗漏。 */
 @source "../**/*.{ts,tsx}";
@@ -83,6 +84,117 @@
     font-family: var(--dn-font-display);
     font-weight: var(--dn-weight-display);
     line-height: var(--dn-leading-display);
+  }
+
+  /* 骨架屏：横向微光扫过，表明"正在加载、内容结构已定"（不只用透明度呼吸）。 */
+  .dn-skeleton {
+    position: relative;
+    overflow: hidden;
+    background-color: var(--dn-divider);
+  }
+
+  .dn-skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background-image: linear-gradient(
+      90deg,
+      transparent,
+      rgba(255, 255, 255, 0.65),
+      transparent
+    );
+    animation: dn-skeleton-sweep 1.4s var(--dn-ease-in) infinite;
+  }
+
+  @keyframes dn-skeleton-sweep {
+    100% {
+      transform: translateX(100%);
+    }
+  }
+
+  /* 列表入场：子项按顺序轻量进入，只在新节点挂载时播放，不会因数据刷新重播。 */
+  .dn-stagger > * {
+    animation: dn-enter var(--dn-duration-page) var(--dn-ease-in) both;
+  }
+
+  .dn-stagger > *:nth-child(1) { animation-delay: calc(var(--dn-stagger) * 0); }
+  .dn-stagger > *:nth-child(2) { animation-delay: calc(var(--dn-stagger) * 1); }
+  .dn-stagger > *:nth-child(3) { animation-delay: calc(var(--dn-stagger) * 2); }
+  .dn-stagger > *:nth-child(4) { animation-delay: calc(var(--dn-stagger) * 3); }
+  .dn-stagger > *:nth-child(5) { animation-delay: calc(var(--dn-stagger) * 4); }
+  .dn-stagger > *:nth-child(6) { animation-delay: calc(var(--dn-stagger) * 5); }
+  .dn-stagger > *:nth-child(n + 7) { animation-delay: calc(var(--dn-stagger) * 6); }
+
+  /* 路由切换顶部进度条：进入时生长、完成后淡出，避免整页重播入场动画。 */
+  .dn-progress-bar {
+    transform-origin: left center;
+    animation: dn-progress-grow 8s var(--dn-ease-out) forwards;
+  }
+
+  @keyframes dn-progress-grow {
+    0% {
+      transform: scaleX(0.05);
+      opacity: 1;
+    }
+    70% {
+      transform: scaleX(0.7);
+      opacity: 1;
+    }
+    100% {
+      transform: scaleX(0.95);
+      opacity: 1;
+    }
+  }
+
+  .dn-progress-bar[data-state="done"] {
+    animation: dn-progress-finish 220ms var(--dn-ease-in) forwards;
+  }
+
+  @keyframes dn-progress-finish {
+    100% {
+      transform: scaleX(1);
+      opacity: 0;
+    }
+  }
+
+  /*
+   * 内联 SVG 趋势图（后台数据分析）：折线描边与柱体生长只解释「数据已就位」。
+   * 仅在允许动效时启用；减少动态效果时图形直接呈现，信息不受影响。
+   */
+  .dn-chart-line {
+    stroke-dasharray: 1;
+    stroke-dashoffset: 0;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .dn-chart-line {
+      animation: dn-chart-draw 900ms var(--dn-ease-out) both;
+    }
+
+    .dn-chart-bar {
+      transform-box: fill-box;
+      transform-origin: bottom;
+      animation: dn-chart-rise 480ms var(--dn-ease-out) both;
+    }
+  }
+
+  @keyframes dn-chart-draw {
+    from {
+      stroke-dashoffset: 1;
+    }
+    to {
+      stroke-dashoffset: 0;
+    }
+  }
+
+  @keyframes dn-chart-rise {
+    from {
+      transform: scaleY(0);
+    }
+    to {
+      transform: scaleY(1);
+    }
   }
 }
 

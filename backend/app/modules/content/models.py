@@ -200,6 +200,8 @@ class FileDerivative(Base, UUIDPrimaryKey, Timestamped):
         String(16), nullable=False, default=DerivativeStatus.PENDING.value
     )
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 多页图片预览的页码（从 1 开始）；非分页产物为 NULL。历史行保持 NULL。
+    page_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

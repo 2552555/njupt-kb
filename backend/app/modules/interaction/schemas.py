@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -87,8 +87,28 @@ class CommentItem(BaseModel):
     user_id: uuid.UUID
     display_name: str
     parent_id: uuid.UUID | None = None
-    body: str
+    body: str | None
     created_at: datetime
+    status: Literal["visible", "withdrawn", "hidden"] = "visible"
+    revision: int = 1
+    # 仅对评论作者（或具备评论管理权限者）返回：管理员隐藏该评论时给出的处理理由。
+    moderation_reason: str | None = None
+
+
+class CommentWithdraw(_InputModel):
+    expected_revision: int = Field(ge=1)
+
+
+class CommentModeration(CommentWithdraw):
+    hidden: bool
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _strip_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("请填写处理理由")
+        return value.strip()
 
 
 # --- 纠错（§20.2）---
@@ -98,6 +118,8 @@ class CorrectionCreate(_InputModel):
     resource_id: uuid.UUID
     version_id: uuid.UUID
     description: str = Field(min_length=1, max_length=2000)
+    suggested_course_id: uuid.UUID | None = None
+    suggested_resource_type: ResourceType | None = None
 
     @field_validator("description")
     @classmethod
@@ -114,12 +136,19 @@ class CorrectionStatusUpdate(_InputModel):
     fixed_version_id: uuid.UUID | None = None
 
 
+class ClassificationFix(_InputModel):
+    expected_revision: int = Field(ge=1)
+    resolution_note: str = Field(min_length=1, max_length=2000)
+
+
 class CorrectionItem(BaseModel):
     id: uuid.UUID
     resource_id: uuid.UUID
     version_id: uuid.UUID
     submitter_id: uuid.UUID
     description: str
+    suggested_course_id: uuid.UUID | None = None
+    suggested_resource_type: ResourceType | None = None
     status: CorrectionStatus
     resolution_note: str | None = None
     fixed_version_id: uuid.UUID | None = None
@@ -155,6 +184,50 @@ class RequestItem(BaseModel):
     follower_count: int
     resolved_resource_id: uuid.UUID | None = None
     created_at: datetime
+    requester_id: uuid.UUID
+    revision: int
+    handled_at: datetime | None = None
+    resolution_available: bool = False
+    resolved_resource_title: str | None = None
+    # 解决资源对当前查看者是否可访问（资源不存在/未发布/无可见性/已撤销发布均为 False）。
+    # 不可访问时不返回标题等可识别信息，前端据此展示「原解决资料当前不可访问」。
+    resolved_resource_accessible: bool = False
+
+
+class RequestStatusUpdate(_InputModel):
+    status: Literal["open", "fulfilled", "closed"]
+    expected_revision: int = Field(ge=1)
+    resource_id: uuid.UUID | None = None
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class RequestReopen(_InputModel):
+    """复核重开：解决资源失效后由发起者或管理员显式重开，不静默改状态。"""
+
+    expected_revision: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _strip_reason(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("请填写复核重开的理由")
+        return cleaned
+
+
+class RequestResponseCreate(_InputModel):
+    resource_id: uuid.UUID
+
+
+class RequestResponseItem(BaseModel):
+    id: uuid.UUID
+    request_id: uuid.UUID
+    submitted_by: uuid.UUID
+    resource_id: uuid.UUID | None
+    resource_title: str | None
+    available: bool
+    created_at: datetime
 
 
 class RequestCreateResult(BaseModel):
@@ -184,3 +257,13 @@ class SearchItem(BaseModel):
     freshness_status: str | None = None
     published_version_id: uuid.UUID | None = None
     rating: RatingSummary
+
+
+class RecommendationItem(SearchItem):
+    reasons: list[str]
+    # 是否为固定探索槽位项：前端据此区分展示（其理由中含「新内容，供探索」）。
+    explore: bool = False
+
+
+class RecommendationsOut(BaseModel):
+    items: list[RecommendationItem]

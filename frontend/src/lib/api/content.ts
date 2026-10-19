@@ -136,6 +136,9 @@ export interface ResourceDetailOut {
   id: string;
   course_id: string;
   offering_id: string | null;
+  /** 贡献者公开身份，用于跳转贡献者主页（§24.1）。 */
+  owner_id: string;
+  owner_display_name: string;
   resource_type: ResourceType;
   publication_status: PublicationStatus;
   freshness_status: FreshnessStatus;
@@ -183,15 +186,57 @@ export interface UploadStatusOut {
   completed_at: string | null;
 }
 
+export interface ManagedResource {
+  id: string;
+  course_id: string;
+  publication_status: PublicationStatus;
+  revision: number;
+  latest_version: VersionOut;
+  updated_at: string;
+}
+
+export interface VersionDetail {
+  resource_id: string;
+  course_id: string;
+  resource_type: ResourceType;
+  publication_status: PublicationStatus;
+  resource_revision: number;
+  version: VersionOut;
+  files: FileOut[];
+  rights: RightsDeclarationIn | null;
+  tags: string[];
+  review_reason: string | null;
+  can_edit: boolean;
+}
+
+export async function inspectFile(resourceId: string, versionId: string, fileId: string): Promise<{ url: string; expires_at: string }> {
+  return (await api.post(`/resources/${resourceId}/versions/${versionId}/files/${fileId}/inspection-grants`)).data;
+}
+
+export async function listMyResources(cursor?: string | null): Promise<CursorPage<ManagedResource>> {
+  return (await api.get('/me/resources', { params: { cursor: cursor || undefined } })).data;
+}
+
+export async function getVersionDetail(resourceId: string, versionId: string): Promise<VersionDetail> {
+  return (await api.get(`/resources/${resourceId}/versions/${versionId}`)).data;
+}
+
+export async function listVersions(resourceId: string): Promise<VersionOut[]> {
+  return (await api.get(`/resources/${resourceId}/versions`)).data;
+}
+
 export interface ResourceListParams {
   course_id?: string;
   college_id?: string;
   offering_id?: string;
   semester_id?: string;
+  /** 按贡献者过滤，用于贡献者主页；可见范围仍由服务端权限决定。 */
+  owner_id?: string;
   year?: number;
   resource_type?: ResourceType;
   keyword?: string;
-  sort?: 'latest' | 'popular';
+  /** latest=最新（默认）/ oldest=最早 / hot=按互动量随时间衰减的热门分。 */
+  sort?: 'latest' | 'popular' | 'oldest' | 'hot';
   limit?: number;
   cursor?: string | null;
 }

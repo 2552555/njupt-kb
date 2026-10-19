@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Sequence
 
-from sqlalchemy import Integer, String, Uuid, column, func, select, table, tuple_, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,8 +42,8 @@ from app.core.errors import (
     RateLimited,
 )
 from app.core.events import emit_event
-from app.core.pagination import CursorPage, decode_cursor, encode_cursor, normalize_page_size
-from app.core.permissions import RESOURCE_REVIEW, has_permission
+from app.core.pagination import CursorPage, encode_cursor, normalize_page_size, seek_descending
+from app.core.permissions import RESOURCE_REVIEW, effective_permissions
 from app.core.ratelimit import check_rate_limit
 from app.modules.moderation.models import (
     AuditLog,
@@ -55,6 +55,7 @@ from app.modules.moderation.models import (
 from app.modules.moderation.schemas import (
     AuditLogOut,
     ModerationSummaryOut,
+    PublicationCandidateOut,
     ReportCreateIn,
     ReportEventIn,
     ReportEventOut,
@@ -123,17 +124,7 @@ async def _page(
 ):
     """按 (时间戳, id) 降序的游标分页，默认 20、上限 100（§25.1）。"""
     size = normalize_page_size(limit)
-    if cursor:
-        payload = decode_cursor(cursor)
-        try:
-            last_ts = datetime.fromisoformat(payload["ts"])
-            last_id = uuid.UUID(payload["id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise InvalidInput("cursor 无效", details={"reason": "malformed"}) from exc
-        if last_ts.tzinfo is None:
-            last_ts = last_ts.replace(tzinfo=timezone.utc)
-        stmt = stmt.where(tuple_(ts_attr, model.id) < tuple_(last_ts, last_id))
-    stmt = stmt.order_by(ts_attr.desc(), model.id.desc()).limit(size + 1)
+    stmt = seek_descending(db, stmt, ts_attr, model.id, cursor).limit(size + 1)
     rows = list((await db.execute(stmt)).scalars().all())
     has_more = len(rows) > size
     rows = rows[:size]
@@ -187,6 +178,8 @@ async def _version_creator(db: AsyncSession, version_id: uuid.UUID):
 def _may_decide(review: Review, viewer: "User | None") -> bool | None:
     if viewer is None:
         return None
+    if viewer.role != Role.ADMIN and review.assigned_reviewer_id not in (None, viewer.id):
+        return False
     if review.submitter_id == viewer.id:
         # §13.3 作者不能审核自己的提交；紧急管理员例外在 decide 中显式记录理由。
         return viewer.role == Role.ADMIN
@@ -334,15 +327,23 @@ async def get_review(db: AsyncSession, review_id: uuid.UUID) -> Review:
     return review
 
 
+async def latest_decision_reason(db: AsyncSession, version_id: uuid.UUID) -> str | None:
+    return await db.scalar(select(ModerationDecision.reason).where(
+        ModerationDecision.version_id == version_id
+    ).order_by(ModerationDecision.created_at.desc()).limit(1))
+
+
 async def can_review(db: AsyncSession, reviewer: "User", version_id: uuid.UUID) -> bool:
     """审核员是否可审核该版本。作者不能审核自己的提交（§13.3）。"""
-    if not has_permission(reviewer, RESOURCE_REVIEW):
+    if reviewer.status != AccountStatus.ACTIVE or RESOURCE_REVIEW not in await effective_permissions(db, reviewer):
         return False
-    review = await _active_review(db, version_id)
-    submitter_id = review.submitter_id if review is not None else await _version_creator(db, version_id)
-    if submitter_id is not None and submitter_id == reviewer.id:
-        return reviewer.role == Role.ADMIN
-    return True
+    if reviewer.role == Role.ADMIN:
+        return True
+    review = await db.scalar(select(Review).where(Review.version_id == version_id)
+                             .order_by(Review.submitted_at.desc()).limit(1))
+    if review is None or review.submitter_id == reviewer.id:
+        return False
+    return review.assigned_reviewer_id is None or review.assigned_reviewer_id == reviewer.id
 
 
 async def decide(
@@ -358,12 +359,16 @@ async def decide(
     """对指定快照给出审核决定。
 
     决定不可原地覆盖；并发时过期快照或已处理任务抛 Conflict（§13.3、§29）。
-    审核通过时调用 content.service.mark_published 切换公开版本。
+    审核通过只记录结论，公开版本由具有 resource.publish 权限的独立操作切换。
+    补证（NEEDS_INFO）只置版本审核状态为 needs_info，不发布、不切换公开指针；
+    作者补充材料后创建关联修订重投，旧结论保留（用户权责 §14.1、§16.3）。
     """
     review = await get_review(db, review_id)
 
-    if not has_permission(reviewer, RESOURCE_REVIEW):
+    if RESOURCE_REVIEW not in await effective_permissions(db, reviewer):
         raise Forbidden("没有审核权限")
+    if not await can_review(db, reviewer, review.version_id):
+        raise Forbidden("该审核任务不在你的处理范围内")
 
     reason = (reason or "").strip()
     emergency_self_review = False
@@ -375,14 +380,21 @@ async def decide(
             raise InvalidInput("紧急管理员自审必须填写明确理由")
         emergency_self_review = True
 
-    if decision not in (ModerationDecisionType.APPROVE, ModerationDecisionType.REJECT):
+    if decision not in (
+        ModerationDecisionType.APPROVE,
+        ModerationDecisionType.NEEDS_INFO,
+        ModerationDecisionType.REJECT,
+    ):
         raise InvalidInput("审核决定无效")
+    if decision == ModerationDecisionType.NEEDS_INFO and not reason:
+        # 补证必须说明需要补充的材料；材料齐备后作者创建关联修订重投，不覆盖本结论（§14.1）。
+        raise InvalidInput("补证决定必须说明需要补充的材料")
 
-    new_status = (
-        ReviewStatus.APPROVED
-        if decision == ModerationDecisionType.APPROVE
-        else ReviewStatus.REJECTED
-    )
+    new_status = {
+        ModerationDecisionType.APPROVE: ReviewStatus.APPROVED,
+        ModerationDecisionType.NEEDS_INFO: ReviewStatus.NEEDS_INFO,
+        ModerationDecisionType.REJECT: ReviewStatus.REJECTED,
+    }[decision]
 
     # 条件更新：仅当仍为待审且快照一致时生效；两名审核员并发只有一个生效（§29 A07）。
     result = await db.execute(
@@ -437,22 +449,15 @@ async def decide(
         request_id=request_id,
     )
 
-    if decision == ModerationDecisionType.APPROVE:
-        await _publish_version(
-            db,
-            resource_id=review.resource_id,
-            version_id=review.version_id,
-            actor_id=reviewer.id,
-            request_id=request_id,
-        )
+    # 审核只产生结论。公开指针由独立的 resource.publish 操作切换（用户权责 §5.3）。
 
     await emit_event(
         db,
-        event_type=(
-            DomainEventType.RESOURCE_VERSION_APPROVED
-            if decision == ModerationDecisionType.APPROVE
-            else DomainEventType.RESOURCE_VERSION_REJECTED
-        ),
+        event_type={
+            ModerationDecisionType.APPROVE: DomainEventType.RESOURCE_VERSION_APPROVED,
+            ModerationDecisionType.NEEDS_INFO: DomainEventType.REVIEW_NEEDS_INFO,
+            ModerationDecisionType.REJECT: DomainEventType.RESOURCE_VERSION_REJECTED,
+        }[decision],
         subject_type="resource_version",
         subject_id=review.version_id,
         subject_version=snapshot_revision,
@@ -528,6 +533,37 @@ async def list_reviews(
 # --------------------------------------------------------------------------- #
 # 发布与时效
 # --------------------------------------------------------------------------- #
+
+
+async def list_publication_candidates(
+    db: AsyncSession, *, limit: int | None = None, cursor: str | None = None,
+) -> CursorPage[PublicationCandidateOut]:
+    from app.modules.content.models import Resource, ResourceVersion
+
+    latest = select(func.max(ResourceVersion.version_no)).where(
+        ResourceVersion.resource_id == Resource.id, ResourceVersion.review_status == "approved",
+    ).correlate(Resource).scalar_subquery()
+    stmt = select(Review).join(ResourceVersion, ResourceVersion.id == Review.version_id).join(
+        Resource, Resource.id == Review.resource_id,
+    ).where(
+        Review.status == "approved", ResourceVersion.version_no == latest,
+        or_(Resource.publication_status != "published", Resource.published_version_id.is_(None),
+            Resource.published_version_id != ResourceVersion.id),
+    )
+    rows, next_cursor, has_more = await _page(db, stmt, model=Review,
+        ts_attr=Review.submitted_at, limit=limit, cursor=cursor)
+    details = {}
+    if rows:
+        details = {vid: (title, revision) for vid, title, revision in (await db.execute(
+            select(ResourceVersion.id, ResourceVersion.title, Resource.revision).join(
+                Resource, Resource.id == ResourceVersion.resource_id,
+            ).where(ResourceVersion.id.in_([review.version_id for review in rows]))
+        )).all()}
+    return CursorPage(items=[PublicationCandidateOut(
+        review_id=review.id, resource_id=review.resource_id, version_id=review.version_id,
+        title=details[review.version_id][0], expected_revision=details[review.version_id][1],
+        reviewed_at=review.decided_at,
+    ) for review in rows], next_cursor=next_cursor, has_more=has_more)
 
 
 async def set_publication(
@@ -1001,22 +1037,9 @@ async def set_account_restriction(
     request_id: str,
 ) -> None:
     """暂停/恢复账号。封禁时撤销全部会话（§14.1、§14.2）。"""
-    from app.modules.identity import service as identity_service
-    from app.modules.identity.service import get_user, revoke_all_sessions
-
-    target = await get_user(db, user_id)
+    from app.modules.identity.service import revoke_all_sessions, set_account_status
     status = AccountStatus.SUSPENDED if suspend else AccountStatus.ACTIVE
-    before_status = str(getattr(target, "status", ""))
-
-    handler = getattr(identity_service, "set_account_status", None)
-    if handler is None:
-        # 契约缺口：INTERFACES.md 未声明账号状态变更函数。显式失败而非静默成功（§25.2）。
-        raise DependencyUnavailable(
-            "identity 模块尚未提供账号状态变更服务",
-            details={"expected": "identity.service.set_account_status"},
-        )
-
-    await handler(
+    before_status = await set_account_status(
         db,
         user_id=user_id,
         status=status,

@@ -28,6 +28,10 @@ nginx/ssl/
 *.db
 *.sqlite3
 uploads/
+backend/dev.db.bak
+*.dump
+*.dump.partial
+*.dump.sha256.json
 
 # 构建产物
 dist/

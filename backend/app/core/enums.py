@@ -112,10 +112,15 @@ class FailureClass(StrEnum):
 
 
 class ReviewStatus(StrEnum):
-    """§13.2 版本审核。"""
+    """§13.2 版本审核。
+
+    beta15 按《用户权责、内容治理与授权收益体系设计文档》§14.1 增加 `NEEDS_INFO`（补证）：
+    补证与重投创建关联修订，不覆盖旧审核结论。
+    """
 
     DRAFT = "draft"
     PENDING = "pending"
+    NEEDS_INFO = "needs_info"
     APPROVED = "approved"
     REJECTED = "rejected"
 
@@ -138,7 +143,10 @@ class FreshnessStatus(StrEnum):
 
 
 class ModerationDecisionType(StrEnum):
+    """§13.2 审核决定。beta15 按用户权责体系 §14.1、§16.3 增加「补证」。"""
+
     APPROVE = "approve"
+    NEEDS_INFO = "needs_info"
     REJECT = "reject"
 
 
@@ -253,6 +261,9 @@ class CourseStatus(StrEnum):
     DEPRECATED = "deprecated"
     MERGED = "merged"
     PENDING_CLASSIFICATION = "pending_classification"
+    # beta10：管理员软停用课程。停用后不再进入前台选择器与检索，
+    # 但已关联资料仍按既有权限读取（不物理删除、不连带撤下）。
+    INACTIVE = "inactive"
 
 
 class CatalogEntityStatus(StrEnum):
@@ -301,6 +312,14 @@ class NotificationType(StrEnum):
     REPORT_RESULT = "report_result"
     CORRECTION_RESULT = "correction_result"
     REQUEST_UPDATED = "request_updated"
+    # --- beta15：用户权责 §4.4 ---
+    REVIEW_NEEDS_INFO = "review_needs_info"
+    CONTRIBUTOR_APPLICATION_RESULT = "contributor_application_result"
+    ASSIGNMENT_CHANGED = "assignment_changed"
+    CASE_RESULT = "case_result"
+    RIGHTS_NOTICE_RESULT = "rights_notice_result"
+    AGREEMENT_UPDATED = "agreement_updated"
+    PRICE_UPDATED = "price_updated"
 
 
 class AIProcessStatus(StrEnum):
@@ -420,7 +439,255 @@ class DomainEventType(StrEnum):
     CORRECTION_RESOLVED = "correction.resolved"
     REQUEST_CREATED = "request.created"
     REQUEST_FULFILLED = "request.fulfilled"
+    REQUEST_UPDATED = "request.updated"
     FILE_SCAN_FINISHED = "file.scan.finished"
     FILE_DERIVATIVE_READY = "file.derivative.ready"
     ORDER_PAID = "order.paid"
     REFUND_CONFIRMED = "refund.confirmed"
+    # --- beta15：用户权责 §4.4 页面与通知 ---
+    REVIEW_NEEDS_INFO = "resource.version.needs_info"
+    CONTRIBUTOR_APPLICATION_SUBMITTED = "contributor.application.submitted"
+    CONTRIBUTOR_APPLICATION_DECIDED = "contributor.application.decided"
+    ASSIGNMENT_CHANGED = "assignment.changed"
+    CASE_CREATED = "case.created"
+    CASE_UPDATED = "case.updated"
+    CASE_DECIDED = "case.decided"
+    RIGHTS_NOTICE_RECEIVED = "rights_notice.received"
+    RIGHTS_NOTICE_COUNTER = "rights_notice.counter"
+    RIGHTS_NOTICE_DECIDED = "rights_notice.decided"
+    # --- beta16：授权协议与双向定价的域事件（补齐 beta15 只落库不通知的边界）---
+    AGREEMENT_ACCEPTED = "agreement.accepted"
+    PRICE_PROPOSED = "price.proposed"
+    PRICE_CONFIRMED = "price.confirmed"
+    PRICE_REJECTED = "price.rejected"
+
+
+# =====================================================================
+# beta15：《课程资料平台用户权责、内容治理与授权收益体系设计文档》v1.0
+# 与《高并发 高可用与性能工程专项设计方案》v1.0 所需的状态枚举。
+# 一律以字符串存储并在迁移中加 CheckConstraint，取值以本文件为唯一来源。
+# =====================================================================
+
+
+class AdminPermissionScope(StrEnum):
+    """`admin_permission_assignments.scope`：系统管理员内部权限的作用范围（§3.1、§15.2）。
+
+    系统管理员不因登录后台自动获得全部敏感操作权限；按职责授予有限权限集合。
+    """
+
+    GLOBAL = "global"
+    CATALOG = "catalog"
+    RESOURCE = "resource"
+    FINANCE = "finance"
+
+
+class AssignmentCapability(StrEnum):
+    """`resource_assignments.capability`：资料管理员被授予的对象级能力（§3.3）。
+
+    RBAC 决定「能做哪类动作」，对象归属与分配决定「可对哪一个对象做」。
+    """
+
+    MAINTAIN = "maintain"
+    REVIEW = "review"
+    MANAGE = "manage"
+
+
+class ContributorOnboardingStatus(StrEnum):
+    """贡献者入驻状态机（§3.4、§14.1）。降级不抹去已生效授权与已得收益。"""
+
+    APPLIED = "applied"
+    UNDER_REVIEW = "under_review"
+    ACTIVE = "active"
+    REJECTED = "rejected"
+    SUSPENDED = "suspended"
+    EXITED = "exited"
+
+
+class CaseType(StrEnum):
+    """案件类型（§13.1）。三类案件分别管理，结论互不自动替代。"""
+
+    DELIVERY_DISPUTE = "delivery_dispute"
+    REVENUE_DISPUTE = "revenue_dispute"
+    RIGHTS_NOTICE = "rights_notice"
+    GENERAL_APPEAL = "general_appeal"
+
+
+class CaseStatus(StrEnum):
+    """案件状态机（§14.1）。反通知、期限与措施是案件事件，不用单一状态丢掉过程。"""
+
+    OPEN = "open"
+    TRIAGED = "triaged"
+    INVESTIGATING = "investigating"
+    DECIDED = "decided"
+    CLOSED = "closed"
+
+
+class CaseSubjectType(StrEnum):
+    """案件指向的对象类型；逐对象作用域过滤，不用任意多态字符串。"""
+
+    RESOURCE = "resource"
+    RESOURCE_VERSION = "resource_version"
+    COMMENT = "comment"
+    ORDER = "order"
+    ORDER_ITEM = "order_item"
+    OTHER = "other"
+
+
+class CaseEventType(StrEnum):
+    """案件事件（§15.5 case_events 追加写，保留转送与送达事实）。"""
+
+    SUBMITTED = "submitted"
+    TRIAGED = "triaged"
+    FORWARDED = "forwarded"
+    COUNTER_NOTICE = "counter_notice"
+    MEASURE_TAKEN = "measure_taken"
+    MEASURE_RELEASED = "measure_released"
+    DECIDED = "decided"
+    CLOSED = "closed"
+    NOTE = "note"
+
+
+class CaseMeasureKind(StrEnum):
+    """必要措施类型（§13.3、§13.4）。措施可解除，记录影响范围。"""
+
+    UNPUBLISH = "unpublish"
+    BLOCK_DOWNLOAD = "block_download"
+    BLOCK_SALES = "block_sales"
+    RESTRICT_PREVIEW = "restrict_preview"
+    FREEZE_REVENUE = "freeze_revenue"
+
+
+class CaseMeasureStatus(StrEnum):
+    ACTIVE = "active"
+    RELEASED = "released"
+
+
+class RightsNoticeStatus(StrEnum):
+    """侵权通知处理进度（§13.3）。期限按适用法定路径记录，不统一写死十五日。"""
+
+    RECEIVED = "received"
+    NEEDS_INFO = "needs_info"
+    FORWARDED = "forwarded"
+    COUNTER_RECEIVED = "counter_received"
+    MEASURED = "measured"
+    CLOSED = "closed"
+
+
+class LedgerBucket(StrEnum):
+    """收益金额分桶（§14.3）。金额子账是事实来源，分桶仅作展示汇总。"""
+
+    PENDING = "pending"
+    AVAILABLE = "available"
+    FROZEN = "frozen"
+    LOCKED = "locked"
+    PAID = "paid"
+    REVERSED = "reversed"
+
+
+class LedgerEventType(StrEnum):
+    """账本事件类型（§15.5）。event_key 全局唯一，追加写。"""
+
+    ORDER_ACCRUAL = "order_accrual"
+    REFUND_REVERSAL = "refund_reversal"
+    FREEZE = "freeze"
+    RELEASE = "release"
+    SETTLEMENT_LOCK = "settlement_lock"
+    PAYOUT = "payout"
+    CORRECTION = "correction"
+
+
+class AgreementState(StrEnum):
+    """商业协议状态机（§14.1）。双方确认同版本才生效；终止不删历史。"""
+
+    DRAFT = "draft"
+    AWAITING_ACCEPTANCE = "awaiting_acceptance"
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    EXPIRED = "expired"
+    TERMINATED = "terminated"
+
+
+class PriceProposalState(StrEnum):
+    """价格方案状态机（§14.1）。改价重建版本；生效需有效协议。"""
+
+    PROPOSED = "proposed"
+    NEGOTIATING = "negotiating"
+    CONFIRMED = "confirmed"
+    EFFECTIVE = "effective"
+    SUPERSEDED = "superseded"
+    WITHDRAWN = "withdrawn"
+
+
+class SettlementStatementState(StrEnum):
+    """结算单状态机（§14.1）。DISPUTED 先回调查；付款在途禁止直接改金额。"""
+
+    DRAFT = "draft"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
+    CONFIRMED = "confirmed"
+    APPROVED = "approved"
+    PAYMENT_PENDING = "payment_pending"
+    PAID = "paid"
+    DISPUTED = "disputed"
+
+
+class PayoutStatus(StrEnum):
+    """付款计划状态（§14.1）。"""
+
+    CREATED = "created"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNCERTAIN = "uncertain"
+
+
+class CacheClass(StrEnum):
+    """缓存分类（高并发专项 §8.1）。
+
+    权限、会话撤销与硬配额属 `AUTH_SENSITIVE`，不得因缓存故障放行。
+    """
+
+    PUBLIC_READ = "public_read"
+    VIEWER_SCOPED = "viewer_scoped"
+    AUTH_SENSITIVE = "auth_sensitive"
+    NO_CACHE = "no_cache"
+
+
+# --- 0.0.3 主动防御（AI 对抗攻击防御设计 §10）---
+class DefenseMode(StrEnum):
+    """风险处置模式。默认 observe：只记录与评估，不改变正常业务结果。"""
+
+    OFF = "off"
+    OBSERVE = "observe"
+    ENFORCE = "enforce"
+
+
+class DefenseSignalKind(StrEnum):
+    """风险信号类别。单个信号不能定性攻击，只作为评分输入（§10.4）。"""
+
+    HONEYPOT_HIT = "honeypot_hit"
+    HONEYTOKEN_HIT = "honeytoken_hit"
+    ENUMERATION = "enumeration"
+    BOUNDARY_PROBE = "boundary_probe"
+    PARAM_SWEEP = "param_sweep"
+    DEEP_PAGINATION = "deep_pagination"
+    RATE_PRESSURE = "rate_pressure"
+
+
+class RiskLevel(StrEnum):
+    NORMAL = "normal"
+    SUSPICIOUS = "suspicious"
+    HIGH = "high"
+
+
+class RiskAction(StrEnum):
+    """处置动作。全部有有效期，可撤销；不放宽任何固定硬配额（§10.5）。"""
+
+    OBSERVE = "observe"
+    THROTTLE = "throttle"
+    CHALLENGE = "challenge"
+    REVIEW = "review"
+
+
+class HoneytokenStatus(StrEnum):
+    ACTIVE = "active"
+    RETIRED = "retired"

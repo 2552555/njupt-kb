@@ -4,9 +4,11 @@ import { notFound } from 'next/navigation';
 
 import { Notice } from '@/components/common/Notice';
 import { ResourceActions } from '@/components/resource/ResourceActions';
+import { ResourceComments } from '@/components/resource/ResourceComments';
 import type { CourseDetail } from '@/lib/api/catalog';
 import type { ResourceDetailOut, VersionFilesOut } from '@/lib/api/content';
 import { serverFetch } from '@/lib/api/server';
+import type { ResourceCountSummary } from '@/lib/api/types';
 import { RESOURCE_TYPE_LABELS } from '@/lib/api/types';
 import { formatDateTime, isUuid } from '@/lib/utils';
 
@@ -26,7 +28,7 @@ export async function generateMetadata({
   const { id } = await params;
   if (!isUuid(id)) return { title: '资料' };
 
-  const { data } = await serverFetch<ResourceDetailOut>(`/resources/${id}`);
+  const { data } = await serverFetch<ResourceDetailOut & ResourceCountSummary>(`/resources/${id}`);
   const title = data?.published_version?.title;
   if (!data || !title) {
     // 未发布或已下架的私有资源不进入索引（§19.3）。
@@ -47,7 +49,7 @@ export default async function ResourceDetailPage({
   const { id } = await params;
   if (!isUuid(id)) notFound();
 
-  const resourceResult = await serverFetch<ResourceDetailOut>(`/resources/${id}`);
+  const resourceResult = await serverFetch<ResourceDetailOut & ResourceCountSummary>(`/resources/${id}`);
   if (resourceResult.error?.status === 404) notFound();
 
   const resource = resourceResult.data;
@@ -69,6 +71,7 @@ export default async function ResourceDetailPage({
 
   const course = courseResult.data;
   const files = filesResult.data?.items ?? [];
+  const ratingSummary = resource.rating_summary ?? null;
 
   return (
     <div className="space-y-8">
@@ -91,9 +94,48 @@ export default async function ResourceDetailPage({
             )}
           </span>
           <span>{freshnessLabels[resource.freshness_status] ?? resource.freshness_status}</span>
+          <span>
+            贡献者{' '}
+            <Link
+              href={`/creators/${resource.owner_id}`}
+              className="underline underline-offset-2"
+            >
+              {resource.owner_display_name}
+            </Link>
+          </span>
           <span>更新于 {formatDateTime(resource.updated_at)}</span>
         </div>
+        {/* 计数统计行（beta14）：下载取已消费授权，收藏与评分随后端聚合。 */}
+        <p className="mt-3 text-sm text-on-color">
+          {resource.download_count ?? 0} 次下载 · {resource.favorite_count ?? 0} 人收藏 ·{' '}
+          {ratingSummary && ratingSummary.count > 0
+            ? `评分 ${ratingSummary.average.toFixed(1)}（${ratingSummary.count} 人）`
+            : '暂无评分'}
+        </p>
       </header>
+
+      <section aria-labelledby="resource-files">
+        <h2 id="resource-files" className="dn-display text-2xl">
+          文件与预览
+        </h2>
+        <div className="mt-3">
+          {filesResult.error ? (
+            <Notice tone="warning" title="文件清单暂时无法加载">
+              {filesResult.error.message}
+            </Notice>
+          ) : (
+            <ResourceActions
+              resourceId={resource.id}
+              versionId={version?.id ?? null}
+              versionNo={version?.version_no ?? null}
+              publicationStatus={resource.publication_status}
+              previewAvailable={resource.preview_available}
+              files={files}
+              resourceTitle={version?.title ?? undefined}
+            />
+          )}
+        </div>
+      </section>
 
       {version?.description && (
         <section aria-labelledby="resource-desc">
@@ -117,27 +159,7 @@ export default async function ResourceDetailPage({
         </section>
       )}
 
-      <section aria-labelledby="resource-files">
-        <h2 id="resource-files" className="dn-display text-2xl">
-          文件与预览
-        </h2>
-        <div className="mt-3">
-          {filesResult.error ? (
-            <Notice tone="warning" title="文件清单暂时无法加载">
-              {filesResult.error.message}
-            </Notice>
-          ) : (
-            <ResourceActions
-              resourceId={resource.id}
-              versionId={version?.id ?? null}
-              versionNo={version?.version_no ?? null}
-              publicationStatus={resource.publication_status}
-              previewAvailable={resource.preview_available}
-              files={files}
-            />
-          )}
-        </div>
-      </section>
+
 
       <section aria-labelledby="resource-known-issues">
         <h2 id="resource-known-issues" className="dn-display text-2xl">
@@ -147,6 +169,15 @@ export default async function ResourceDetailPage({
           如果内容有误、包含不应公开的信息，或你不清楚来源是否允许分发，请通过资料页的「举报/纠错」提交。
           举报会进入独立工单，受理不等于认定违规。
         </p>
+      </section>
+
+      <section aria-labelledby="resource-comments">
+        <h2 id="resource-comments" className="dn-display text-2xl">
+          讨论
+        </h2>
+        <div className="mt-3">
+          <ResourceComments resourceId={resource.id} />
+        </div>
       </section>
     </div>
   );

@@ -21,6 +21,7 @@ from app.core.enums import (
     UploadSessionStatus,
 )
 from app.core.pagination import CursorPage
+from app.modules.interaction.schemas import RatingSummary
 
 
 # --- 请求 ---
@@ -148,6 +149,9 @@ class ResourceDetailOut(BaseModel):
     id: uuid.UUID
     course_id: uuid.UUID
     offering_id: uuid.UUID | None
+    # 贡献者公开身份：贡献者主页按 owner_id 只读展示（§24.1）。
+    owner_id: uuid.UUID
+    owner_display_name: str
     resource_type: ResourceType
     publication_status: PublicationStatus
     freshness_status: FreshnessStatus
@@ -157,6 +161,11 @@ class ResourceDetailOut(BaseModel):
     updated_at: datetime
     published_version: VersionOut | None
     preview_available: bool
+    # 计数展示（beta14）：下载取 consumed 状态的 download_grants；收藏取 favorites 行数；
+    # 评分复用 interaction 的聚合逻辑（§20.1），不在本模块重复实现。
+    download_count: int = 0
+    favorite_count: int = 0
+    rating_summary: RatingSummary | None = None
 
 
 class PublicationOut(BaseModel):
@@ -193,3 +202,26 @@ class UploadStatusOut(BaseModel):
     scan_status: ScanStatus | None
     created_at: datetime
     completed_at: datetime | None
+
+
+class ManagedResourceOut(BaseModel):
+    id: uuid.UUID
+    course_id: uuid.UUID
+    publication_status: PublicationStatus
+    revision: int
+    latest_version: VersionOut
+    updated_at: datetime
+
+
+class VersionDetailOut(BaseModel):
+    resource_id: uuid.UUID
+    course_id: uuid.UUID
+    resource_type: ResourceType
+    publication_status: PublicationStatus
+    resource_revision: int
+    version: VersionOut
+    files: list[FileOut]
+    rights: RightsDeclarationIn | None
+    tags: list[str]
+    review_reason: str | None
+    can_edit: bool

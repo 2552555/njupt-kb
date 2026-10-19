@@ -6,12 +6,27 @@
 import { api } from './client';
 import type { Capability, CursorPage, EntitlementSourceType, ScopeType } from './types';
 
+export interface PreviewPage {
+  page_no: number;
+  url: string;
+  url_expires_at: string;
+}
+
 export interface PreviewGrantResult {
   grant_id: string;
   preview_url: string;
   url_expires_at: string;
   file_name: string;
   version_no: number;
+  /**
+   * 预览形态（prevew.md 五）：image=水印 WebP 图片；pdf=受限预览 PDF；thumbnail=缩略图。
+   * 旧版接口或 fixture 可能不带该字段，缺省按 pdf 处理。
+   */
+  preview_type?: 'image' | 'pdf' | 'thumbnail';
+  /** 多页图片预览：逐页短期 URL，最多 PREVIEW_IMAGE_MAX_PAGES 页；缺省时只用 preview_url。 */
+  pages?: PreviewPage[];
+  /** 图片预览是否由服务端叠加水印（匿名与登录都有）。 */
+  watermarked?: boolean;
 }
 
 export interface DownloadGrantResult {

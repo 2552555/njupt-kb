@@ -11,7 +11,7 @@ export const metadata: Metadata = {
     template: '%s · 南邮课程知识平台',
   },
   description:
-    '南京邮电大学课程资料与学习内容平台：按课程、学期与类型查找可追溯的学习资料。',
+    '南京邮电大学课程资料：笔记、试卷、课件与复习资料。',
   applicationName: '南邮课程知识平台',
   formatDetection: { telephone: false },
 };

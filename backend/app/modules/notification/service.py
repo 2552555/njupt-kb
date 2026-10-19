@@ -18,7 +18,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import Uuid, and_, bindparam, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import Capability, DomainEventType, NotificationType
@@ -328,6 +328,33 @@ async def _load_version(session: AsyncSession, version_id: uuid.UUID) -> Any | N
         return None
 
 
+async def _load_correction(
+    session: AsyncSession, correction_id: uuid.UUID
+) -> dict[str, uuid.UUID | None] | None:
+    """只读 interaction 的 corrections 表（不导入对方模型类，§2.2）。"""
+    row = (
+        await session.execute(
+            text(
+                "SELECT submitter_id, handled_by, resource_id, version_id "
+                "FROM corrections WHERE id = :correction_id"
+            )
+            .bindparams(bindparam("correction_id", type_=Uuid()))
+            .columns(
+                submitter_id=Uuid(), handled_by=Uuid(), resource_id=Uuid(), version_id=Uuid()
+            ),
+            {"correction_id": correction_id},
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    return {
+        "submitter_id": row.submitter_id,
+        "handled_by": row.handled_by,
+        "resource_id": row.resource_id,
+        "version_id": row.version_id,
+    }
+
+
 async def _notify_version_submitted(
     session: AsyncSession, event: DomainEvent
 ) -> list[Notification]:
@@ -394,7 +421,10 @@ async def _notify_published(
     title_text = version.title if version is not None else "资料"
 
     notifications: list[Notification] = []
-    for user_id in await _course_followers(session, resource.course_id):
+    creators = await session.execute(text("SELECT user_id FROM follows WHERE target_type = 'creator' AND target_id = :creator")
+                                     .bindparams(bindparam("creator", type_=Uuid())).columns(user_id=Uuid()), {"creator": resource.owner_id})
+    recipients = set(await _course_followers(session, resource.course_id)) | {row[0] for row in creators}
+    for user_id in recipients:
         if user_id == resource.owner_id:
             continue
         if version_id is None or not await _can_read(
@@ -471,13 +501,49 @@ async def _notify_report_resolved(
     ]
 
 
+async def _notify_correction_resolved(
+    session: AsyncSession, event: DomainEvent
+) -> list[Notification]:
+    """纠错工单处理结果：通知提交人；处理人即提交人时不通知自己（§20.2）。
+
+    收件人只认纠错工单的提交人，处理人优先使用事件发生时的载荷，
+    与资料所有权判断解耦；CORRECTION_CREATED 是提交人本人动作，不登记通知。
+    """
+    correction = await _load_correction(session, event.subject_id)
+    if correction is None:
+        return []
+    status = str((event.payload or {}).get("status", ""))
+    if status == "open":
+        return []
+    submitter_id = correction["submitter_id"]
+    handler_id = _payload_uuid(event, "handled_by") or correction["handled_by"]
+    if submitter_id == handler_id:
+        # 自己处理自己提交的工单，不给自己发通知。
+        return []
+    outcomes = {"accepted": "已采纳", "fixed": "已修复", "rejected": "未采纳"}
+    return [
+        _build(
+            submitter_id,
+            NotificationType.CORRECTION_RESULT,
+            "你的纠错已有处理结果",
+            f"你提交的纠错{outcomes.get(status, '已处理')}。",
+            {
+                "correction_id": str(event.subject_id),
+                "status": status,
+                "resource_id": str(correction["resource_id"]),
+                "version_id": str(correction["version_id"]),
+            },
+        )
+    ]
+
+
 async def _course_followers(session: AsyncSession, course_id: uuid.UUID) -> list[uuid.UUID]:
     """只读 interaction 的 follows 表（不导入对方模型类，§2.2）。"""
     rows = await session.execute(
         text(
             "SELECT user_id FROM follows "
             "WHERE target_type = 'course' AND target_id = :course_id"
-        ),
+        ).bindparams(bindparam("course_id", type_=Uuid())).columns(user_id=Uuid()),
         {"course_id": course_id},
     )
     return [row[0] for row in rows]
@@ -511,6 +577,354 @@ async def _can_read(
         return False
 
 
+async def _notify_request_updated(session: AsyncSession, event: DomainEvent) -> list[Notification]:
+    from app.modules.interaction.request_management import get_request
+    from app.modules.interaction.service import request_followers
+    try:
+        row = await get_request(session, event.subject_id)
+    except NotFound:
+        return []
+    payload = event.payload or {}
+    response = payload.get("kind") == "response"
+    recipients = {row.requester_id} if response else set(await request_followers(session, row.id)) | {row.requester_id}
+    status = str(payload.get("status", "open"))
+    labels = {"open": "重新寻找资料", "fulfilled": "已确认解决", "closed": "已关闭"}
+    body = "你的资料需求收到新的候选资料，请核对后确认。" if response else f"你关注的资料需求{labels.get(status, '状态已更新')}。"
+    return [_build(uid, NotificationType.REQUEST_UPDATED, "资料需求有更新", body,
+                   {"request_id": str(row.id), "course_id": str(row.course_id)}) for uid in recipients]
+
+
+# --------------------------------------------------------------------- #
+# beta15 用户权责 §4.4：补证、入驻、管理范围、案件与侵权通知的站内通知
+# --------------------------------------------------------------------- #
+
+
+async def _notify_review_needs_info(
+    session: AsyncSession, event: DomainEvent
+) -> list[Notification]:
+    """补证：通知版本作者需要补充材料；不发布、不切换公开指针（§14.1、§16.3）。"""
+    version = await _load_version(session, event.subject_id)
+    if version is None:
+        return []
+    reason = (event.payload or {}).get("reason")
+    body = f"《{version.title}》需要补充材料。"
+    if reason:
+        body += f"原因：{reason}"
+    return [
+        _build(
+            version.created_by,
+            NotificationType.REVIEW_NEEDS_INFO,
+            "资料需要补充材料",
+            body,
+            {"resource_id": str(version.resource_id), "version_id": str(version.id)},
+        )
+    ]
+
+
+async def _load_application(session: AsyncSession, application_id: uuid.UUID) -> Any | None:
+    from app.modules.creator.models import ContributorApplication
+
+    return await session.get(ContributorApplication, application_id)
+
+
+async def _notify_contributor_application_submitted(
+    session: AsyncSession, event: DomainEvent
+) -> list[Notification]:
+    """入驻申请受理回执：通知申请人本人（§3.4、§4.4）。"""
+    applicant_id = _payload_uuid(event, "user_id")
+    if applicant_id is None:
+        application = await _load_application(session, event.subject_id)
+        applicant_id = application.user_id if application is not None else None
+    if applicant_id is None:
+        return []
+    return [
+        _build(
+            applicant_id,
+            NotificationType.CONTRIBUTOR_APPLICATION_RESULT,
+            "入驻申请已提交",
+            "你的专业贡献者入驻申请已提交，等待平台审核。",
+            {"application_id": str(event.subject_id), "status": "applied"},
+        )
+    ]
+
+
+async def _notify_contributor_application_decided(
+    session: AsyncSession, event: DomainEvent
+) -> list[Notification]:
+    """入驻审核结果：通知申请人；处理人即申请人时不通知自己（§3.4）。"""
+    payload = event.payload or {}
+    applicant_id = _payload_uuid(event, "user_id")
+    decider_id = _payload_uuid(event, "decided_by")
+    if applicant_id is None or decider_id is None:
+        application = await _load_application(session, event.subject_id)
+        if application is not None:
+            applicant_id = applicant_id or application.user_id
+            decider_id = decider_id or application.decided_by
+    if applicant_id is None:
+        return []
+    if decider_id is not None and decider_id == applicant_id:
+        # 处理人即申请人（如管理员自审），不给自己发通知（沿用 beta14 惯例）。
+        return []
+    status = str(payload.get("status") or payload.get("decision") or "")
+    outcomes = {
+        "active": "已通过，你已成为入驻贡献者。",
+        "rejected": "未通过。",
+        "under_review": "已受理，正在审核中。",
+        "suspended": "专业身份已暂停，受托管理范围已撤销。既有合同和收益记录保留。",
+        "exited": "专业身份已退出。既有合同和收益记录保留。",
+    }
+    body = f"你的入驻申请{outcomes.get(status, '有新的处理结果')}"
+    reason = payload.get("reason")
+    if status == "rejected" and reason:
+        body += f"原因：{reason}"
+    return [
+        _build(
+            applicant_id,
+            NotificationType.CONTRIBUTOR_APPLICATION_RESULT,
+            "入驻申请处理结果",
+            body,
+            {"application_id": str(event.subject_id), "status": status},
+        )
+    ]
+
+
+async def _notify_assignment_changed(
+    session: AsyncSession, event: DomainEvent
+) -> list[Notification]:
+    """管理范围/权限变更：通知被授予人（§3.3、§4.4）。"""
+    user_id = _payload_uuid(event, "user_id")
+    if user_id is None:
+        return []
+    payload = event.payload or {}
+    action = str(payload.get("action", ""))
+    granted = action != "revoked"
+    permission = payload.get("permission")
+    if permission:
+        body = f"你的权限「{permission}」{'已授予' if granted else '已撤销'}。"
+    else:
+        body = f"你的资料管理范围{'已更新' if granted else '已撤销'}。"
+    return [
+        _build(
+            user_id,
+            NotificationType.ASSIGNMENT_CHANGED,
+            "管理范围已更新",
+            body,
+            {"assignment_id": str(event.subject_id), "action": action},
+        )
+    ]
+
+
+async def _load_case(session: AsyncSession, case_id: uuid.UUID) -> Any | None:
+    from app.modules.cases.models import Case
+
+    return await session.get(Case, case_id)
+
+
+async def _load_rights_notice(session: AsyncSession, notice_id: uuid.UUID) -> Any | None:
+    from app.modules.cases.models import RightsNotice
+
+    return await session.get(RightsNotice, notice_id)
+
+
+async def _notify_case_created(
+    session: AsyncSession, event: DomainEvent
+) -> list[Notification]:
+    """案件受理：通知申请人（§4.4）。"""
+    applicant_id = _payload_uuid(event, "applicant_id")
+    case = None
+    if applicant_id is None:
+        case = await _load_case(session, event.subject_id)
+        applicant_id = case.applicant_id if case is not None else None
+    if applicant_id is None:
+        return []
+    return [
+        _build(
+            applicant_id,
+            NotificationType.CASE_RESULT,
+            "你的案件已受理",
+            "你提交的案件已受理，可在案件详情查看进度。",
+            {"case_id": str(event.subject_id)},
+        )
+    ]
+
+
+async def _notify_case_progress(
+    session: AsyncSession, event: DomainEvent, *, title: str, body: str
+) -> list[Notification]:
+    """案件进展/裁决：通知申请人；处理人即申请人时不通知自己（§4.4）。"""
+    case = await _load_case(session, event.subject_id)
+    if case is None:
+        return []
+    applicant_id = case.applicant_id
+    if case.handler_id is not None and case.handler_id == applicant_id:
+        return []
+    return [
+        _build(
+            applicant_id,
+            NotificationType.CASE_RESULT,
+            title,
+            body,
+            {"case_id": str(case.id), "state": str(case.state)},
+        )
+    ]
+
+
+async def _notify_case_updated(session: AsyncSession, event: DomainEvent) -> list[Notification]:
+    return await _notify_case_progress(
+        session, event, title="案件有新的进展", body="你提交的案件有新的处理进展，可查看详情。"
+    )
+
+
+async def _notify_case_decided(session: AsyncSession, event: DomainEvent) -> list[Notification]:
+    return await _notify_case_progress(
+        session, event, title="案件已有处理结论", body="你提交的案件已有处理结论，可查看详情。"
+    )
+
+
+async def _notify_rights_notice_received(
+    session: AsyncSession, event: DomainEvent
+) -> list[Notification]:
+    """侵权通知受理回执：通知通知人本人（§13.3、§4.4）。"""
+    payload = event.payload or {}
+    claimant_id = _payload_uuid(event, "claimant_id")
+    if claimant_id is None:
+        case_id = _payload_uuid(event, "case_id")
+        case = await _load_case(session, case_id) if case_id else None
+        claimant_id = case.applicant_id if case is not None else None
+    if claimant_id is None:
+        return []
+    return [
+        _build(
+            claimant_id,
+            NotificationType.RIGHTS_NOTICE_RESULT,
+            "侵权通知已收到",
+            "你的侵权通知已收到，平台将按流程处理。",
+            {
+                "case_id": str(payload.get("case_id") or ""),
+                "rights_notice_id": str(event.subject_id),
+            },
+        )
+    ]
+
+
+async def _notify_rights_notice_counter(
+    session: AsyncSession, event: DomainEvent
+) -> list[Notification]:
+    """反通知：通知原通知人；提交人本人不重复通知（§13.3、§4.4）。"""
+    case_id = _payload_uuid(event, "case_id")
+    case = await _load_case(session, case_id) if case_id else None
+    if case is None:
+        return []
+    claimant_id = case.applicant_id
+    actor_id = _payload_uuid(event, "actor_id")
+    if actor_id is not None and actor_id == claimant_id:
+        return []
+    return [
+        _build(
+            claimant_id,
+            NotificationType.RIGHTS_NOTICE_RESULT,
+            "收到反通知",
+            "你的侵权通知已收到被通知方的反通知，平台将继续处理。",
+            {"case_id": str(case.id), "rights_notice_id": str(event.subject_id)},
+        )
+    ]
+
+
+async def _notify_rights_notice_decided(
+    session: AsyncSession, event: DomainEvent
+) -> list[Notification]:
+    """侵权通知处理结论：通知原通知人（§4.4）。"""
+    case_id = _payload_uuid(event, "case_id")
+    case = await _load_case(session, case_id) if case_id else None
+    if case is None:
+        notice = await _load_rights_notice(session, event.subject_id)
+        case = await _load_case(session, notice.case_id) if notice is not None else None
+    if case is None:
+        return []
+    return [
+        _build(
+            case.applicant_id,
+            NotificationType.RIGHTS_NOTICE_RESULT,
+            "侵权通知处理结果",
+            "你的侵权通知已有处理结果，可查看详情。",
+            {"case_id": str(case.id), "rights_notice_id": str(event.subject_id)},
+        )
+    ]
+
+
+async def _notify_licensing_event(
+    session: AsyncSession, event: DomainEvent
+) -> list[Notification]:
+    """仅给签约方和有相应权限的平台人员发状态提醒，不携带金额和条款。"""
+    from app.core.permissions import AGREEMENT_MANAGE, PRICE_CONFIRM
+    from app.modules.assignment.models import AdminPermissionAssignment
+    from app.modules.identity.models import User
+    from app.modules.licensing.models import AgreementVersion, LicenseAgreement, PriceProposal
+    from app.modules.licensing.service import PLATFORM_PARTY_ID
+
+    agreement_event = event.event_type == DomainEventType.AGREEMENT_ACCEPTED
+    permission = AGREEMENT_MANAGE if agreement_event else PRICE_CONFIRM
+    actor_id = _payload_uuid(event, "actor_id") or _payload_uuid(event, "proposed_by")
+    if agreement_event:
+        version = await session.get(AgreementVersion, event.subject_id)
+        agreement = await session.get(LicenseAgreement, version.agreement_id) if version else None
+        if agreement is None:
+            return []
+        owner_id = agreement.contributor_party_id
+        platform_id = agreement.platform_party_id
+        acting_party = _payload_uuid(event, "party_id")
+        data = {"agreement_id": str(agreement.id)}
+    else:
+        from app.modules.commerce.models import Product
+
+        proposal = await session.get(PriceProposal, event.subject_id)
+        product = await session.get(Product, proposal.product_id) if proposal else None
+        if product is None:
+            return []
+        owner_id = product.owner_id
+        platform_id = PLATFORM_PARTY_ID
+        acting_party = (
+            _payload_uuid(event, "party_id") or _payload_uuid(event, "rejected_by") or actor_id
+        )
+        data = {"price_proposal_id": str(proposal.id)}
+
+    recipients = set()
+    if owner_id and acting_party != owner_id:
+        recipients.add(owner_id)
+    # 确认价格是双方完成的共同事实，双方都收到结果（处理人除外）。
+    confirmed = event.event_type == DomainEventType.PRICE_CONFIRMED
+    if confirmed and owner_id:
+        recipients.add(owner_id)
+    if acting_party != platform_id or confirmed:
+        if platform_id != PLATFORM_PARTY_ID:
+            recipients.add(platform_id)
+        else:
+            now = _now()
+            delegated = select(AdminPermissionAssignment.user_id).where(
+                AdminPermissionAssignment.permission == permission,
+                AdminPermissionAssignment.scope == "global",
+                AdminPermissionAssignment.scope_catalog_id.is_(None),
+                AdminPermissionAssignment.scope_resource_id.is_(None),
+                AdminPermissionAssignment.revoked_at.is_(None),
+                or_(AdminPermissionAssignment.valid_until.is_(None),
+                    AdminPermissionAssignment.valid_until > now),
+            )
+            recipients.update((await session.scalars(select(User.id).where(
+                User.status == "active", or_(User.role == "admin", User.id.in_(delegated)),
+            ))).all())
+    recipients.discard(actor_id)
+    if not recipients:
+        return []
+    recipients = set((await session.scalars(select(User.id).where(
+        User.id.in_(recipients), User.status == "active",
+    ))).all())
+    title = "授权协议确认进度" if agreement_event else "价格方案状态更新"
+    return [_build(
+        recipient, NotificationType.AGREEMENT_UPDATED if agreement_event else NotificationType.PRICE_UPDATED,
+        title, "相关方案已有更新，请查看当前版本后处理。", data,
+    ) for recipient in sorted(recipients)]
+
+
 _EVENT_HANDLERS: dict[str, _EventHandler] = {
     DomainEventType.RESOURCE_VERSION_SUBMITTED.value: _notify_version_submitted,
     DomainEventType.RESOURCE_VERSION_APPROVED.value: _notify_review_result,
@@ -518,6 +932,29 @@ _EVENT_HANDLERS: dict[str, _EventHandler] = {
     DomainEventType.RESOURCE_PUBLISHED.value: _notify_published,
     DomainEventType.RESOURCE_WITHDRAWN.value: _notify_withdrawn,
     DomainEventType.REPORT_RESOLVED.value: _notify_report_resolved,
+    # CORRECTION_CREATED 是提交人本人动作，无需站内通知，故意不登记。
+    DomainEventType.CORRECTION_RESOLVED.value: _notify_correction_resolved,
+    DomainEventType.REQUEST_UPDATED.value: _notify_request_updated,
+    # --- beta15 用户权责 §4.4：补证、入驻、管理范围、案件与侵权通知 ---
+    DomainEventType.REVIEW_NEEDS_INFO.value: _notify_review_needs_info,
+    DomainEventType.CONTRIBUTOR_APPLICATION_SUBMITTED.value: (
+        _notify_contributor_application_submitted
+    ),
+    DomainEventType.CONTRIBUTOR_APPLICATION_DECIDED.value: (
+        _notify_contributor_application_decided
+    ),
+    DomainEventType.ASSIGNMENT_CHANGED.value: _notify_assignment_changed,
+    DomainEventType.CASE_CREATED.value: _notify_case_created,
+    DomainEventType.CASE_UPDATED.value: _notify_case_updated,
+    DomainEventType.CASE_DECIDED.value: _notify_case_decided,
+    DomainEventType.RIGHTS_NOTICE_RECEIVED.value: _notify_rights_notice_received,
+    DomainEventType.RIGHTS_NOTICE_COUNTER.value: _notify_rights_notice_counter,
+    DomainEventType.RIGHTS_NOTICE_DECIDED.value: _notify_rights_notice_decided,
+    # --- beta16 授权协议与双向定价：登记分发（暂不构造通知，见处理器 docstring）---
+    DomainEventType.AGREEMENT_ACCEPTED.value: _notify_licensing_event,
+    DomainEventType.PRICE_PROPOSED.value: _notify_licensing_event,
+    DomainEventType.PRICE_CONFIRMED.value: _notify_licensing_event,
+    DomainEventType.PRICE_REJECTED.value: _notify_licensing_event,
 }
 
 

@@ -9,20 +9,27 @@
 
 任务处理入口（供 jobs 模块的 FILE_SCAN / FILE_DERIVE 处理器调用）：
     process_file_scan(db, file_id=...) / process_file_derive(db, file_id=...)
+
+按用户水印预览（prevew.md 五、十二，供 access 预览授予调用）：
+    ensure_watermarked_preview(db, source_file=..., user=...)
 """
 
 from __future__ import annotations
 
 import re
+import hashlib
 import tempfile
 import uuid
+import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import (
     Integer,
+    String,
     Uuid,
     and_,
+    case,
     column,
     delete,
     func,
@@ -41,8 +48,10 @@ from app.core.enums import (
     DomainEventType,
     FilePurpose,
     FreshnessStatus,
+    GrantStatus,
     JobType,
     PublicationStatus,
+    ResourceType,
     ReviewStatus,
     RightsBasis,
     ScanStatus,
@@ -51,12 +60,14 @@ from app.core.enums import (
 from app.core.errors import Conflict, Forbidden, InvalidInput, NotFound
 from app.core.events import emit_event
 from app.core.pagination import decode_cursor, encode_cursor, normalize_page_size
-from app.core.permissions import RESOURCE_PUBLISH, RESOURCE_REVIEW, RESOURCE_WITHDRAW, has_permission
-from app.core.storage import build_storage_key, storage
+from app.core.permissions import RESOURCE_PUBLISH, RESOURCE_REVIEW, effective_permissions
+from app.core.storage import ObjectSizeExceeded, build_storage_key, storage
 from app.modules.content.derivatives import (
     PROCESSOR_VERSION,
     DerivativeError,
     build_derivatives,
+    build_watermarked_pages,
+    build_watermarked_preview,
     primary_kind,
 )
 from app.modules.content.models import (
@@ -70,7 +81,15 @@ from app.modules.content.models import (
     UploadSession,
     VersionFile,
 )
-from app.modules.content.scanning import ScanOutcome, scan_quarantined_object
+from app.modules.content.scanning import (
+    DOCX_MIME,
+    JPEG_MIME,
+    PDF_MIME,
+    PNG_MIME,
+    PPTX_MIME,
+    ScanOutcome,
+    scan_quarantined_object,
+)
 from app.modules.content.schemas import (
     FileOut,
     PublicationOut,
@@ -94,6 +113,11 @@ _OFFERINGS = table(
     "course_offerings", column("id", Uuid), column("course_id", Uuid), column("semester_id", Uuid)
 )
 _SEMESTERS = table("semesters", column("id", Uuid), column("academic_year", Integer))
+# 计数展示用的跨模块只读引用：不导入 access/interaction 模型类（§2.2）。
+_DOWNLOAD_GRANTS = table(
+    "download_grants", column("resource_id", Uuid), column("status", String)
+)
+_FAVORITES = table("favorites", column("resource_id", Uuid))
 
 
 def _now() -> datetime:
@@ -180,6 +204,15 @@ async def mark_published(
         raise NotFound("版本不属于该资源")
     if version.review_status != ReviewStatus.APPROVED.value:
         raise Conflict("公开版本必须指向已通过审核的版本", code="VERSION_NOT_APPROVED")
+
+    pairs = await version_files(db, version.id)
+    if not pairs or len([link for link, _ in pairs if link.purpose == FilePurpose.PRIMARY.value]) != 1:
+        raise Conflict("发布版本缺少唯一主文件", code="FILE_NOT_READY")
+    if any(file.scan_status != ScanStatus.PASSED.value for _, file in pairs):
+        raise Conflict("文件尚未通过安全检查，不能发布", code="FILE_NOT_READY")
+    rights = await db.scalar(select(RightsDeclaration).where(RightsDeclaration.version_id == version.id))
+    if rights is None or rights.rights_basis not in ("original", "authorized", "open_license"):
+        raise Conflict("缺少有效展示与传播许可，不能发布", code="DISTRIBUTION_NOT_ALLOWED")
 
     result = await db.execute(
         update(Resource)
@@ -368,6 +401,47 @@ async def reassign_resource_course(
 # --------------------------------------------------------------------------- #
 # 内部辅助
 # --------------------------------------------------------------------------- #
+async def correct_classification(
+    db, *, resource_id, version_id, course_id, resource_type,
+    expected_revision, actor_id, reason, request_id,
+):
+    resource = await get_resource(db, resource_id)
+    if resource.published_version_id != version_id:
+        raise Conflict("公开版本已变化，请重新核对纠错", code="STALE_VERSION")
+    values = {"revision": Resource.revision + 1}
+    before = {"course_id": str(resource.course_id), "resource_type": resource.resource_type,
+              "offering_id": str(resource.offering_id) if resource.offering_id else None}
+    if course_id is not None:
+        from app.modules.catalog.service import get_course
+        course = await get_course(db, course_id)
+        if course.status != "active":
+            raise InvalidInput("请选择有效课程")
+        values["course_id"] = course_id
+        if course_id != resource.course_id:
+            values["offering_id"] = None
+    if resource_type is not None:
+        values["resource_type"] = ResourceType(resource_type).value
+    result = await db.execute(update(Resource).where(
+        Resource.id == resource_id, Resource.revision == expected_revision,
+        Resource.published_version_id == version_id,
+    ).values(**values))
+    if result.rowcount != 1:
+        raise Conflict("资料已更新，请刷新后重试", code="STALE_REVISION")
+    await record_audit(db, actor_id=actor_id, action="resource.classification_corrected",
+                       object_type="resource", object_id=resource_id, before=before,
+                       after={k: str(v) for k, v in values.items() if k != "revision"},
+                       reason=reason, request_id=request_id)
+
+
+async def _owner_display_name(db: AsyncSession, owner_id: uuid.UUID) -> str:
+    """贡献者公开显示名；账号已注销时用匿名占位，不泄露账号信息（§24.1、§29）。"""
+    from app.modules.identity.service import display_name_of, get_users
+
+    users = await get_users(db, [owner_id])
+    owner = users.get(owner_id)
+    return display_name_of(owner) if owner is not None else "用户"
+
+
 def _version_out(version: ResourceVersion) -> VersionOut:
     return VersionOut(
         id=version.id,
@@ -400,10 +474,11 @@ def _file_out(link: VersionFile, file: ResourceFile) -> FileOut:
     )
 
 
-def _is_manager(user) -> bool:
-    return bool(user) and (
-        has_permission(user, RESOURCE_REVIEW) or has_permission(user, RESOURCE_PUBLISH)
-    )
+async def _is_manager(db: AsyncSession, user) -> bool:
+    if user is None:
+        return False
+    granted = await effective_permissions(db, user)
+    return RESOURCE_REVIEW in granted or RESOURCE_PUBLISH in granted
 
 
 async def _preview_ready(db: AsyncSession, version_id: uuid.UUID) -> bool:
@@ -422,6 +497,59 @@ async def _preview_ready(db: AsyncSession, version_id: uuid.UUID) -> bool:
         )
     )
     return bool(count)
+
+
+async def _resource_download_count(db: AsyncSession, resource_id: uuid.UUID) -> int:
+    """下载计数：只统计 consumed 状态的 download_grants（§17.2）。"""
+    count = await db.scalar(
+        select(func.count())
+        .select_from(_DOWNLOAD_GRANTS)
+        .where(
+            _DOWNLOAD_GRANTS.c.resource_id == resource_id,
+            _DOWNLOAD_GRANTS.c.status == GrantStatus.CONSUMED.value,
+        )
+    )
+    return int(count or 0)
+
+
+async def _resource_favorite_count(db: AsyncSession, resource_id: uuid.UUID) -> int:
+    """收藏计数：favorites 行数（§20.1）。"""
+    count = await db.scalar(
+        select(func.count())
+        .select_from(_FAVORITES)
+        .where(_FAVORITES.c.resource_id == resource_id)
+    )
+    return int(count or 0)
+
+
+def _hot_score_expression(db: AsyncSession, as_of: datetime):
+    """资源热门分（beta14 sort=hot）：互动量按创建时间衰减，全程在 SQL 内计算。
+
+    score = 互动量 / (age_days + HOT_SCORE_TIME_DECAY_DAYS) ^ HOT_SCORE_DECAY_POWER，
+    互动量 = favorites 计数 + 已消费 download_grants 计数；age 从 Resource.created_at 起算。
+    系数取自主控统一配置（app/config.py）；SQLite 用 julianday、PG 用 extract(epoch)，
+    两者方言均内置 pow，避免把整表拉回内存排序。
+    """
+    decay_days = settings.HOT_SCORE_TIME_DECAY_DAYS
+    decay_power = settings.HOT_SCORE_DECAY_POWER
+    engagement = func.coalesce(
+        select(func.count()).select_from(_FAVORITES)
+        .where(_FAVORITES.c.resource_id == Resource.id).scalar_subquery(),
+        0,
+    ) + func.coalesce(
+        select(func.count()).select_from(_DOWNLOAD_GRANTS)
+        .where(
+            _DOWNLOAD_GRANTS.c.resource_id == Resource.id,
+            _DOWNLOAD_GRANTS.c.status == GrantStatus.CONSUMED.value,
+        ).scalar_subquery(),
+        0,
+    )
+    if db.get_bind().dialect.name == "sqlite":
+        age_days = func.julianday(as_of) - func.julianday(Resource.created_at)
+    else:
+        age_days = (as_of.timestamp() - func.extract("epoch", Resource.created_at)) / 86400.0
+    age_days = case((age_days < 0, 0.0), else_=age_days)
+    return engagement / func.pow(age_days + decay_days, decay_power)
 
 
 async def _load_owned_files(
@@ -509,10 +637,15 @@ async def _next_version_no(db: AsyncSession, resource_id: uuid.UUID) -> int:
     return (current or 0) + 1
 
 
-async def _ensure_owner(resource: Resource, user) -> None:
-    if resource.owner_id != user.id and not _is_manager(user):
-        # 私有对象统一 404，避免泄露存在性（§25.1）。
-        raise NotFound("资源不存在")
+async def _ensure_owner(db: AsyncSession, resource: Resource, user) -> None:
+    if resource.owner_id != user.id and user.role != "admin":
+        # owner 判定之外只追加分配判定；审核权限语义不变（§3.3）。
+        from app.core.enums import AssignmentCapability
+        from app.modules.assignment.service import can_manage_resource
+
+        if not await can_manage_resource(db, user, resource.id, AssignmentCapability.MAINTAIN):
+            # 私有对象统一 404，避免泄露存在性（§25.1）。
+            raise NotFound("资源不存在")
 
 
 async def _validate_offering(db: AsyncSession, *, course_id: uuid.UUID, offering_id: uuid.UUID | None) -> None:
@@ -544,6 +677,9 @@ async def create_resource(
     )
     db.add(resource)
     await db.flush()
+
+    from app.modules.access.service import initialize_policy
+    resource.access_policy_id = await initialize_policy(db, resource.id)
 
     version = ResourceVersion(
         resource_id=resource.id,
@@ -585,7 +721,7 @@ async def create_version(
 ) -> VersionOut:
     """创建修订草稿；被驳回后修订形成新的可追溯提交（§12.1）。"""
     resource = await get_resource(db, resource_id)
-    await _ensure_owner(resource, user)
+    await _ensure_owner(db, resource, user)
     version = ResourceVersion(
         resource_id=resource.id,
         version_no=await _next_version_no(db, resource.id),
@@ -627,7 +763,7 @@ async def update_version(
 ) -> VersionOut:
     """修改本人可编辑草稿；用 revision 做条件更新，过期提交返回 409（§13.3）。"""
     resource = await get_resource(db, resource_id)
-    await _ensure_owner(resource, user)
+    await _ensure_owner(db, resource, user)
     version = await get_version(db, version_id)
     if version.resource_id != resource.id:
         raise NotFound("版本不属于该资源")
@@ -685,7 +821,7 @@ async def submit_version(
     from app.modules.moderation.service import open_review
 
     resource = await get_resource(db, resource_id)
-    await _ensure_owner(resource, user)
+    await _ensure_owner(db, resource, user)
     version = await get_version(db, version_id)
     if version.resource_id != resource.id:
         raise NotFound("版本不属于该资源")
@@ -764,10 +900,19 @@ async def submit_version(
 async def withdraw_resource(
     db: AsyncSession, *, user, resource_id: uuid.UUID, payload, request_id: str | None
 ) -> PublicationOut:
-    """作者或管理员撤回；撤回不物理删除文件（§13.3）。"""
+    """作者、管理员或受管资料管理员撤回；撤回不物理删除文件（§13.3）。
+
+    权限判定 = owner ∨ 管理员 ∨ 该资源上有效的 `MANAGE` 分配。分配是 owner 之外的
+    **追加**判定，不放宽审核权限：审核仍由 `RESOURCE_REVIEW` 决定（§3.3）。
+    无权限时统一 404，不泄露资源是否存在（§25.1）；审计 actor 记实际操作人。
+    """
     resource = await get_resource(db, resource_id)
-    if resource.owner_id != user.id and not has_permission(user, RESOURCE_WITHDRAW):
-        raise NotFound("资源不存在")
+    if resource.owner_id != user.id and user.role != "admin":
+        from app.core.enums import AssignmentCapability
+        from app.modules.assignment.service import can_manage_resource
+
+        if not await can_manage_resource(db, user, resource.id, AssignmentCapability.MANAGE):
+            raise NotFound("资源不存在")
     if resource.publication_status != PublicationStatus.PUBLISHED.value:
         raise Conflict("资源当前不处于已发布状态，无法撤回", code="NOT_PUBLISHED")
     await mark_withdrawn(
@@ -788,23 +933,40 @@ async def withdraw_resource(
 
 
 async def get_resource_detail(db: AsyncSession, *, user, resource_id: uuid.UUID) -> ResourceDetailOut:
+    from app.modules.access.service import authorize
+    from app.core.enums import Capability
+    from app.modules.interaction.service import resource_rating_summary
+
     resource = await get_resource(db, resource_id)
-    is_owner = bool(user) and user.id == resource.owner_id
+    from app.core.enums import AssignmentCapability
+    from app.modules.assignment.service import can_manage_resource
+
+    # owner 判定之外只追加分配判定，与列表/搜索使用同一作用域（§3.3）。
+    manages = bool(user) and await can_manage_resource(
+        db, user, resource.id, AssignmentCapability.MAINTAIN
+    )
     is_public = (
         resource.publication_status == PublicationStatus.PUBLISHED.value
         and resource.published_version_id is not None
     )
-    if not (is_public or is_owner or _is_manager(user)):
+    if not (is_public or manages or await _is_manager(db, user)):
         raise NotFound("资源不存在")
 
     version = await published_version(db, resource)
+    if version is not None:
+        await authorize(db, user=user, resource_id=resource.id, version_id=version.id,
+                        capability=Capability.READ_METADATA)
     preview_available = False
     if version is not None and not version.preview_disabled:
         preview_available = await _preview_ready(db, version.id)
+    download_count = await _resource_download_count(db, resource.id)
+    favorite_count = await _resource_favorite_count(db, resource.id)
     return ResourceDetailOut(
         id=resource.id,
         course_id=resource.course_id,
         offering_id=resource.offering_id,
+        owner_id=resource.owner_id,
+        owner_display_name=await _owner_display_name(db, resource.owner_id),
         resource_type=resource.resource_type,
         publication_status=PublicationStatus(resource.publication_status),
         freshness_status=FreshnessStatus(resource.freshness_status),
@@ -814,16 +976,21 @@ async def get_resource_detail(db: AsyncSession, *, user, resource_id: uuid.UUID)
         updated_at=resource.updated_at,
         published_version=_version_out(version) if version else None,
         preview_available=preview_available,
+        download_count=download_count,
+        favorite_count=favorite_count,
+        rating_summary=await resource_rating_summary(db, resource.id),
     )
 
 
 async def list_resources(
     db: AsyncSession,
     *,
+    user=None,
     course_id: uuid.UUID | None = None,
     college_id: uuid.UUID | None = None,
     offering_id: uuid.UUID | None = None,
     semester_id: uuid.UUID | None = None,
+    owner_id: uuid.UUID | None = None,
     year: int | None = None,
     resource_type=None,
     keyword: str | None = None,
@@ -831,14 +998,27 @@ async def list_resources(
     limit: int | None = None,
     cursor: str | None = None,
 ) -> ResourceListOut:
-    """已发布资源列表；默认只返回已发布版本（§19.1）。"""
-    if sort not in ("latest", "oldest"):
-        raise InvalidInput("不支持的排序方式", details={"allowed": ["latest", "oldest"]})
+    """已发布资源列表；默认只返回已发布版本（§19.1）。
+
+    ``sort=hot``（beta14）按热门分降序 + id 降序：互动量按创建时间衰减
+    （``_hot_score_expression``），游标键为 score + id，与 latest/oldest 的
+    时间游标不可混用；默认排序行为不变。
+    """
+    if sort not in ("latest", "oldest", "hot"):
+        raise InvalidInput("不支持的排序方式", details={"allowed": ["latest", "oldest", "hot"]})
     size = normalize_page_size(limit)
 
-    stmt = select(Resource).where(Resource.publication_status == PublicationStatus.PUBLISHED.value)
+    from app.modules.access.visibility import visible_resource_ids
+
+    stmt = select(Resource).where(
+        Resource.publication_status == PublicationStatus.PUBLISHED.value,
+        Resource.id.in_(visible_resource_ids(user)),
+    )
     if course_id is not None:
         stmt = stmt.where(Resource.course_id == course_id)
+    if owner_id is not None:
+        # 贡献者主页按作者过滤；可见范围仍由 visible_resource_ids 决定，不扩大权限。
+        stmt = stmt.where(Resource.owner_id == owner_id)
     if offering_id is not None:
         stmt = stmt.where(Resource.offering_id == offering_id)
     if resource_type is not None:
@@ -867,39 +1047,69 @@ async def list_resources(
         pattern = f"%{keyword.strip()}%"
         stmt = stmt.where(
             Resource.id.in_(
-                select(ResourceVersion.resource_id).where(ResourceVersion.title.ilike(pattern))
+                select(ResourceVersion.resource_id).where(
+                    ResourceVersion.id == Resource.published_version_id,
+                    ResourceVersion.title.ilike(pattern),
+                )
             )
         )
 
+    as_of = _now()
     if cursor:
         payload = decode_cursor(cursor)
         try:
-            ts = datetime.fromisoformat(payload["ts"])
             last_id = uuid.UUID(payload["id"])
+            if sort == "hot":
+                last_score = float(payload["s"])
+                as_of = datetime.fromisoformat(payload["at"])
+                if not math.isfinite(last_score) or last_score < 0 or as_of.tzinfo is None:
+                    raise ValueError("invalid hot cursor")
+            else:
+                ts = datetime.fromisoformat(payload["ts"])
         except (KeyError, ValueError, TypeError) as exc:
             raise InvalidInput("cursor 无效") from exc
-        ts = _aware(ts)
-        if sort == "latest":
+        if sort == "hot":
+            # 固定首屏计分时间，避免时间衰减令已展示行落入后续页。
+            hot_score = _hot_score_expression(db, as_of)
             stmt = stmt.where(
                 or_(
-                    Resource.updated_at < ts,
-                    and_(Resource.updated_at == ts, Resource.id < last_id),
-                )
+                    hot_score < last_score,
+                    and_(hot_score == last_score, Resource.id < last_id),
+                ),
             )
         else:
-            stmt = stmt.where(
-                or_(
-                    Resource.updated_at > ts,
-                    and_(Resource.updated_at == ts, Resource.id > last_id),
+            ts = _aware(ts)
+            if sort == "latest":
+                stmt = stmt.where(
+                    or_(
+                        Resource.updated_at < ts,
+                        and_(Resource.updated_at == ts, Resource.id < last_id),
+                    )
                 )
-            )
+            else:
+                stmt = stmt.where(
+                    or_(
+                        Resource.updated_at > ts,
+                        and_(Resource.updated_at == ts, Resource.id > last_id),
+                    )
+                )
 
-    if sort == "latest":
+    if sort == "hot":
+        hot_score = _hot_score_expression(db, as_of)
+        stmt = stmt.add_columns(hot_score.label("hot_score")).order_by(hot_score.desc(), Resource.id.desc())
+    elif sort == "latest":
         stmt = stmt.order_by(Resource.updated_at.desc(), Resource.id.desc())
     else:
         stmt = stmt.order_by(Resource.updated_at.asc(), Resource.id.asc())
 
-    rows = list((await db.execute(stmt.limit(size + 1))).scalars().all())
+    result = await db.execute(stmt.limit(size + 1))
+    scores = {}
+    if sort == "hot":
+        ranked = result.all()
+        rows = [row[0] for row in ranked]
+        scores = {row[0].id: float(row.hot_score) for row in ranked}
+    else:
+        rows = list(result.scalars().all())
     has_more = len(rows) > size
     rows = rows[:size]
 
@@ -926,11 +1136,14 @@ async def list_resources(
                 updated_at=row.updated_at,
             )
         )
-    next_cursor = (
-        encode_cursor({"ts": rows[-1].updated_at.isoformat(), "id": str(rows[-1].id)})
-        if has_more and rows
-        else None
-    )
+    if sort == "hot" and has_more and rows:
+        next_cursor = encode_cursor({"s": scores[rows[-1].id], "id": str(rows[-1].id), "at": as_of.isoformat()})
+    else:
+        next_cursor = (
+            encode_cursor({"ts": rows[-1].updated_at.isoformat(), "id": str(rows[-1].id)})
+            if has_more and rows
+            else None
+        )
     return ResourceListOut(items=items, next_cursor=next_cursor, has_more=has_more)
 
 
@@ -942,14 +1155,25 @@ async def list_version_files(
     version = await get_version(db, version_id)
     if version.resource_id != resource.id:
         raise NotFound("版本不属于该资源")
-    is_owner = bool(user) and user.id == resource.owner_id
+    from app.core.enums import AssignmentCapability
+    from app.modules.assignment.service import can_manage_resource
+
+    # owner 判定之外只追加分配判定，与列表/详情使用同一作用域（§3.3）。
+    manages = bool(user) and await can_manage_resource(
+        db, user, resource.id, AssignmentCapability.MAINTAIN
+    )
     is_public = (
         resource.publication_status == PublicationStatus.PUBLISHED.value
         and resource.published_version_id == version.id
     )
     # 历史版本默认仅作者与有权限管理人员可见（§12.1、D08）。
-    if not (is_owner or is_public or _is_manager(user)):
+    if not (manages or is_public or await _is_manager(db, user)):
         raise NotFound("版本不存在")
+
+    from app.modules.access.service import authorize
+    from app.core.enums import Capability
+    await authorize(db, user=user, resource_id=resource.id, version_id=version.id,
+                    capability=Capability.READ_METADATA)
 
     pairs = await version_files(db, version.id)
     return VersionFilesOut(
@@ -963,6 +1187,13 @@ async def list_version_files(
 # 上传会话（§16 步骤 1-4）
 # --------------------------------------------------------------------------- #
 async def create_upload_session(db: AsyncSession, *, user, payload: UploadCreateIn) -> UploadCreateOut:
+    """创建上传会话（§16 步骤 1-4）。
+
+    `resource_id` 非空时，owner 之外**追加**该资源上的有效 `MAINTAIN` 分配判定，
+    使受管资料管理员能为受管资源上传文件。此处只放行「创建上传会话」，
+    不放宽后续「提交版本」链路的既有权限规则（`_ensure_owner` 保持原样）。
+    会话的 `uploader_id` 始终记实际创建人，不改变资源归属。
+    """
     mime = payload.declared_mime.strip().lower()
     if mime not in settings.ALLOWED_UPLOAD_MIME:
         raise InvalidInput("不支持的文件类型", details={"allowed": settings.ALLOWED_UPLOAD_MIME})
@@ -972,7 +1203,13 @@ async def create_upload_session(db: AsyncSession, *, user, payload: UploadCreate
     if payload.resource_id is not None:
         resource = await get_resource(db, payload.resource_id)
         if resource.owner_id != user.id:
-            raise NotFound("资源不存在")
+            from app.core.enums import AssignmentCapability
+            from app.modules.assignment.service import can_manage_resource
+
+            if not await can_manage_resource(
+                db, user, resource.id, AssignmentCapability.MAINTAIN
+            ):
+                raise NotFound("资源不存在")
 
     storage_key = build_storage_key("uploads", payload.original_name)
     session = UploadSession(
@@ -1102,15 +1339,18 @@ async def process_file_scan(db: AsyncSession, *, file_id: uuid.UUID) -> ScanStat
     """检查任务：自行计算哈希、识别真实格式、执行扫描（§16 步骤 5）。"""
     from app.modules.jobs.service import enqueue
 
-    file = await get_file(db, file_id)
+    file = await db.scalar(select(ResourceFile).where(ResourceFile.id == file_id).with_for_update().execution_options(populate_existing=True))
+    if file is None:
+        raise NotFound("文件不存在")
     if file.scan_status == ScanStatus.PASSED.value:
         return ScanStatus.PASSED
 
     file.scan_status = ScanStatus.RUNNING.value
     await db.flush()
 
+    verified_key = build_storage_key("originals", file.original_name)
     outcome: ScanOutcome = await scan_quarantined_object(
-        file.storage_key, original_name=file.original_name
+        file.storage_key, original_name=file.original_name, verified_storage_key=verified_key
     )
     if outcome.sha256:
         file.sha256 = outcome.sha256
@@ -1125,7 +1365,7 @@ async def process_file_scan(db: AsyncSession, *, file_id: uuid.UUID) -> ScanStat
 
     if outcome.status == ScanStatus.PASSED:
         # 扫描通过后才允许从隔离区转入私有区（§16）。
-        await storage.promote(file.storage_key, target_bucket=settings.S3_BUCKET_PRIVATE)
+        file.storage_key = verified_key
         if file.upload_session_id:
             session = await db.get(UploadSession, file.upload_session_id)
             if session is not None:
@@ -1150,21 +1390,26 @@ async def process_file_scan(db: AsyncSession, *, file_id: uuid.UUID) -> ScanStat
 
 async def process_file_derive(db: AsyncSession, *, file_id: uuid.UUID) -> DerivativeStatus:
     """预览派生任务；失败不改变原件审核事实，不假显示“预览就绪”（§13.1）。"""
-    file = await get_file(db, file_id)
+    file = await db.scalar(select(ResourceFile).where(ResourceFile.id == file_id).with_for_update().execution_options(populate_existing=True))
+    if file is None:
+        raise NotFound("文件不存在")
     if file.scan_status != ScanStatus.PASSED.value:
         raise Conflict("文件尚未通过安全检查，不能生成预览", code="FILE_NOT_READY")
 
-    await db.execute(delete(FileDerivative).where(FileDerivative.source_file_id == file.id))
     kind = primary_kind(file.detected_mime)
+
+    ready = await db.scalar(select(FileDerivative.id).where(
+        FileDerivative.source_file_id == file.id, FileDerivative.kind == kind.value,
+        FileDerivative.processor_version == PROCESSOR_VERSION, FileDerivative.status == DerivativeStatus.READY.value,
+    ).limit(1))
+    if ready is not None:
+        return DerivativeStatus.READY
 
     with tempfile.TemporaryDirectory(prefix="njupt-derive-") as tmp:
         workdir = Path(tmp)
         source = workdir / "source"
-        with source.open("wb") as handle:
-            await storage.download_to_file(
-                file.storage_key, handle, bucket=settings.S3_BUCKET_PRIVATE
-            )
         try:
+            await _download_verified_source(file, source)
             artifacts = await build_derivatives(
                 source, detected_mime=file.detected_mime or "", workdir=workdir
             )
@@ -1181,6 +1426,11 @@ async def process_file_derive(db: AsyncSession, *, file_id: uuid.UUID) -> Deriva
             await db.flush()
             return DerivativeStatus.FAILED
 
+        # 成功得到完整产物后才替换旧的普通派生记录，失败不清空已有预览。
+        await db.execute(delete(FileDerivative).where(
+            FileDerivative.source_file_id == file.id,
+            FileDerivative.kind.in_([DerivativeKind.PREVIEW_PDF.value, DerivativeKind.THUMBNAIL.value]),
+        ))
         for artifact in artifacts:
             derivative_key = build_storage_key("derivatives", artifact.path.name)
             with artifact.path.open("rb") as handle:
@@ -1209,3 +1459,187 @@ async def process_file_derive(db: AsyncSession, *, file_id: uuid.UUID) -> Deriva
             payload={"file_id": str(file.id), "kinds": [item.kind.value for item in artifacts]},
         )
         return DerivativeStatus.READY
+
+
+# --------------------------------------------------------------------------- #
+# 按用户水印预览（prevew.md 五、十二）
+# --------------------------------------------------------------------------- #
+def user_short_code(user_id: uuid.UUID, *, length: int = 8) -> str:
+    """用户水印短码：HMAC-SHA256(SECRET_KEY, user_id) 前 8 位十六进制。
+
+    不用 UUID 前缀：任何人拿到短码都无法对着用户表枚举反查本人（prevew.md 十二）；
+    复用现有 SECRET_KEY，不引入新的密钥配置。
+    """
+    import hashlib
+    import hmac
+
+    digest = hmac.new(settings.SECRET_KEY.encode("utf-8"), user_id.bytes, hashlib.sha256)
+    return digest.hexdigest()[:length].upper()
+
+
+async def _ensure_watermarked_pages(
+    db: AsyncSession,
+    *,
+    source_file: ResourceFile,
+    user,
+    max_pages: int,
+    build,
+) -> list[FileDerivative]:
+    """生成/复用前 N 页水印图片预览；失败返回空列表，由调用方回退既有预览。
+
+    - 浏览器拿到的是 page1.webp…pageN.webp，权限隔离由服务端渲染保证。
+    - 登录用户的水印含本人短码：同一文件不同用户是不同 FileDerivative 行，
+      不在任何公开桶放无水印原图。
+    - 匿名用户没有可绑定身份，使用固定平台水印并共享同一批派生对象；
+      水印同样平铺，不能靠裁剪边缘去掉。
+    - 开关关闭、格式不支持或生成失败时返回空列表，不阻断预览链路。
+    """
+    if not (settings.PREVIEW_IMAGE_ENABLED and settings.PREVIEW_WATERMARK_ENABLED):
+        return []
+    source_file = await db.scalar(
+        select(ResourceFile)
+        .where(ResourceFile.id == source_file.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if source_file is None or source_file.scan_status != ScanStatus.PASSED.value:
+        return []
+    mime = source_file.detected_mime
+    if mime not in (PDF_MIME, PNG_MIME, JPEG_MIME, DOCX_MIME, PPTX_MIME):
+        return []
+
+    if user is None:
+        # 匿名：固定平台水印 + 共享对象键；不写入任何个人标识。
+        owner_key = "anon"
+        watermark_text = settings.PREVIEW_ANONYMOUS_WATERMARK
+    else:
+        short_code = user_short_code(user.id)
+        # 展示短码不作为所有权键，避免截断摘要碰撞后复用其他用户的水印。
+        owner_key = user_short_code(user.id, length=64)
+        watermark_text = f"U{short_code} · {_now().date().isoformat()}"
+
+    existing = (
+        (
+            await db.execute(
+                select(FileDerivative)
+                .where(
+                    FileDerivative.source_file_id == source_file.id,
+                    FileDerivative.kind == DerivativeKind.WATERMARKED_PREVIEW.value,
+                    FileDerivative.processor_version == PROCESSOR_VERSION,
+                    FileDerivative.status == DerivativeStatus.READY.value,
+                    FileDerivative.page_no.is_not(None),
+                    FileDerivative.storage_key.like(f"%-{owner_key}.webp"),
+                )
+                .order_by(FileDerivative.page_no)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if existing:
+        # 已就绪：直接复用，不重复渲染。
+        return list(existing)
+
+    with tempfile.TemporaryDirectory(prefix="njupt-wm-preview-") as tmp:
+        workdir = Path(tmp)
+        source = workdir / "source"
+        try:
+            await _download_verified_source(source_file, source)
+        except DerivativeError:
+            return []
+        artifacts = await build(
+            source,
+            detected_mime=mime,
+            workdir=workdir,
+            watermark_text=watermark_text,
+            max_pages=max_pages,
+        )
+        if not artifacts:
+            return []
+        rows: list[FileDerivative] = []
+        for artifact in artifacts:
+            page_no = artifact.page_no or 1
+            # 键含用户短码与页码：同文件不同用户、不同页都是不同对象（prevew.md 十二）。
+            derivative_key = f"derivatives/{uuid.uuid4().hex}-p{page_no}-{owner_key}.webp"
+            with artifact.path.open("rb") as handle:
+                await storage.put_file(
+                    derivative_key,
+                    handle,
+                    artifact.content_type,
+                    bucket=settings.S3_BUCKET_PRIVATE,
+                )
+            row = FileDerivative(
+                source_file_id=source_file.id,
+                processor_version=PROCESSOR_VERSION,
+                kind=DerivativeKind.WATERMARKED_PREVIEW.value,
+                storage_key=derivative_key,
+                status=DerivativeStatus.READY.value,
+                page_count=artifact.page_count,
+                page_no=page_no,
+            )
+            db.add(row)
+            rows.append(row)
+        await db.flush()
+        return rows
+
+
+async def ensure_watermarked_preview_pages(
+    db: AsyncSession, *, source_file: ResourceFile, user
+) -> list[FileDerivative]:
+    """多页水印图片预览（PDF / 图片 / Office 统一图片化）。"""
+    return await _ensure_watermarked_pages(
+        db,
+        source_file=source_file,
+        user=user,
+        max_pages=settings.PREVIEW_IMAGE_MAX_PAGES,
+        build=build_watermarked_pages,
+    )
+
+
+async def ensure_watermarked_preview(
+    db: AsyncSession, *, source_file: ResourceFile, user
+) -> FileDerivative | None:
+    """兼容入口：只保证第一页水印图片（旧调用方与测试使用）。
+
+    匿名用户现在也会得到带平台水印的第一页图片；如需回退既有受限预览，
+    调用方仍按「无行则回退」处理。
+    """
+    pages = await _ensure_watermarked_pages(
+        db,
+        source_file=source_file,
+        user=user,
+        max_pages=1,
+        build=_build_single_page,
+    )
+    return pages[0] if pages else None
+
+
+async def _build_single_page(
+    source: Path,
+    *,
+    detected_mime: str,
+    workdir: Path,
+    watermark_text: str,
+    max_pages: int = 1,
+) -> list:
+    """单页构建适配：复用旧的 `build_watermarked_preview`，保持测试与回退语义。"""
+    artifact = await build_watermarked_preview(
+        source, detected_mime=detected_mime, workdir=workdir, watermark_text=watermark_text
+    )
+    return [artifact] if artifact is not None else []
+
+
+async def _download_verified_source(file: ResourceFile, destination: Path) -> None:
+    if not file.sha256:
+        raise DerivativeError("缺少安全检查摘要，不能生成新的预览")
+    try:
+        with destination.open("wb") as handle:
+            written = await storage.download_to_file(file.storage_key, handle, bucket=settings.S3_BUCKET_PRIVATE)
+    except ObjectSizeExceeded as exc:
+        raise DerivativeError("文件超过大小上限") from exc
+    digest = hashlib.sha256()
+    with destination.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if written != file.size or digest.hexdigest() != file.sha256:
+        raise DerivativeError("文件字节与安全检查记录不一致")

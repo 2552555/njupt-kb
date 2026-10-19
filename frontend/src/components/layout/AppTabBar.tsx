@@ -2,13 +2,14 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { BookOpen, Home, Search, User } from 'lucide-react';
+import { BookOpen, Home, FileUp, Search, User } from 'lucide-react';
 
 const items = [
   { href: '/', label: '首页', icon: Home },
   { href: '/courses', label: '课程', icon: BookOpen },
+  { href: '/upload', label: '上传', icon: FileUp },
   { href: '/search', label: '搜索', icon: Search },
-  { href: '/me/resources', label: '我的', icon: User },
+  { href: '/me', label: '我的', icon: User },
 ];
 
 function isActive(pathname: string, href: string): boolean {
@@ -27,7 +28,7 @@ export function AppTabBar() {
     >
       <ul className="mx-auto flex max-w-6xl">
         {items.map((item) => {
-          const active = isActive(pathname, item.href);
+          const active = item.href === '/me' ? pathname === '/me' || pathname.startsWith('/me/') : isActive(pathname, item.href);
           const Icon = item.icon;
           return (
             <li key={item.href} className="flex-1">

@@ -27,6 +27,7 @@ from app.core.enums import (
 )
 from app.core.security import hash_password
 from app.db import async_session_factory
+import app.models_registry  # noqa: F401 — 确保 Base.metadata 完整，跨模块外键可解析
 from app.modules.catalog.models import Course
 
 # 演示账号：邮箱与口令都带 demo 前缀，避免与真实账号混淆。
@@ -59,15 +60,19 @@ async def _demo_user(session: AsyncSession):
 async def _demo_resource(session: AsyncSession, owner_id, course: Course):
     from app.modules.content.models import Resource, ResourceVersion
 
-    resource = (
+    # 标题自 beta3 起迁到 ResourceVersion：按版本标题定位演示资源（§12.1）。
+    existing_version = (
         await session.execute(
-            select(Resource).where(
-                Resource.owner_id == owner_id, Resource.title == DEMO_RESOURCE_TITLE
+            select(ResourceVersion)
+            .join(Resource, Resource.id == ResourceVersion.resource_id)
+            .where(
+                Resource.owner_id == owner_id,
+                ResourceVersion.title == DEMO_RESOURCE_TITLE,
             )
         )
     ).scalar_one_or_none()
-    if resource is not None:
-        return resource
+    if existing_version is not None:
+        return existing_version.resource
 
     resource = Resource(
         course_id=course.id,

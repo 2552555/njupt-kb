@@ -9,9 +9,12 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
+from sqlalchemy import and_, func, or_
 
 from app.core.errors import InvalidInput
 
@@ -49,3 +52,22 @@ def decode_cursor(cursor: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise InvalidInput("cursor 无效", details={"reason": "malformed"})
     return payload
+
+
+def seek_descending(db, stmt, timestamp, identity, cursor):
+    """按同一时间表达式排序/翻页，兼容 SQLite 默认时间的小数位差异。"""
+    sqlite = db.bind.dialect.name == "sqlite"
+    stamp = func.strftime("%Y-%m-%d %H:%M:%f", timestamp) if sqlite else timestamp
+    stmt = stmt.order_by(stamp.desc(), identity.desc())
+    if not cursor:
+        return stmt
+    try:
+        payload = decode_cursor(cursor)
+        moment = datetime.fromisoformat(payload["ts"])
+        item_id = uuid.UUID(payload["id"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise InvalidInput("cursor 无效") from exc
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    point = func.strftime("%Y-%m-%d %H:%M:%f", moment) if sqlite else moment
+    return stmt.where(or_(stamp < point, and_(stamp == point, identity < item_id)))

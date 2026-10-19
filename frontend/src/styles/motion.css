@@ -1,0 +1,38 @@
+/* Optional DNDL feedback; no global animation, reset, or page replay. */
+.dn-interactive {
+  border-radius: var(--dn-radius);
+  transition: transform var(--dn-duration-hover) var(--dn-ease-in),
+    box-shadow var(--dn-duration-hover) var(--dn-ease-in);
+}
+@media (hover: hover) and (pointer: fine) {
+  .dn-interactive:hover:not(:disabled):not([aria-disabled="true"]) {
+    transform: translateY(var(--dn-hover-lift));
+    box-shadow: var(--dn-shadow-2);
+  }
+}
+.dn-interactive:active:not(:disabled):not([aria-disabled="true"]) {
+  transform: scale(var(--dn-press-scale));
+  box-shadow: var(--dn-shadow-1);
+  transition-duration: var(--dn-duration-press);
+}
+.dn-focus:focus-visible {
+  outline: var(--dn-focus-width) solid var(--dn-focus);
+  outline-offset: var(--dn-focus-offset);
+}
+.dn-enter {
+  animation: dn-enter var(--dn-duration-page) var(--dn-ease-in) both;
+  animation-delay: calc(var(--dn-enter-index, 0) * var(--dn-stagger));
+}
+@keyframes dn-enter {
+  from { opacity: 0; transform: translateX(-16px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dn-interactive { transition: none; }
+  .dn-interactive:hover:not(:disabled):not([aria-disabled="true"]),
+  .dn-interactive:active:not(:disabled):not([aria-disabled="true"]) { transform: none; }
+  .dn-enter { animation: none; }
+}
+@media (forced-colors: active) {
+  .dn-focus:focus-visible { outline-color: Highlight; }
+}

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import (
@@ -23,6 +24,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -39,7 +41,17 @@ __all__ = [
     "Report",
     "ReportEvent",
     "AuditLog",
+    "CommentAppeal",
+    "AppealStatus",
 ]
+
+
+class AppealStatus(StrEnum):
+    """§18、§20.2 评论申诉状态。模块内局部枚举，避免改动共享的 app.core.enums。"""
+
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
 
 
 class StringUUID(TypeDecorator):
@@ -144,12 +156,27 @@ class Report(Base, UUIDPrimaryKey, Timestamped):
 
     举报有独立工单，不把资源直接改成一个含义混杂的 reported 状态；
     受理举报不等于认定违规。
+
+    beta10 最小扩展：``comment_id`` 非空表示这是评论举报（沿用同一工单表，不新开重复模型），
+    ``revision`` 供状态流转的乐观并发校验。同一用户对同一评论至多一条未处理举报，由局部唯一索引约束。
     """
 
     __tablename__ = "reports"
     __table_args__ = (
         _enum_check("status", ReportStatus, "status_valid"),
         Index("ix_reports_status_created_at", "status", "created_at"),
+        Index(
+            "uq_reports_active_comment_reporter",
+            "reporter_id",
+            "comment_id",
+            unique=True,
+            postgresql_where=text(
+                "comment_id IS NOT NULL AND status IN ('open', 'triaged', 'investigating')"
+            ),
+            sqlite_where=text(
+                "comment_id IS NOT NULL AND status IN ('open', 'triaged', 'investigating')"
+            ),
+        ),
     )
 
     resource_id: Mapped[uuid.UUID] = mapped_column(
@@ -157,6 +184,10 @@ class Report(Base, UUIDPrimaryKey, Timestamped):
     )
     version_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("resource_versions.id"), nullable=True, index=True
+    )
+    # 评论举报指向具体评论；资源举报为 NULL。
+    comment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("comments.id", ondelete="CASCADE"), nullable=True, index=True
     )
     reporter_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id"), nullable=False, index=True
@@ -166,6 +197,7 @@ class Report(Base, UUIDPrimaryKey, Timestamped):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default=ReportStatus.OPEN.value, index=True
     )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
 
 
 class ReportEvent(Base, UUIDPrimaryKey, CreatedAt):
@@ -195,6 +227,39 @@ class ReportEvent(Base, UUIDPrimaryKey, CreatedAt):
     to_status: Mapped[str] = mapped_column(String(20), nullable=False)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+
+class CommentAppeal(Base, UUIDPrimaryKey, Timestamped):
+    """评论申诉（§18、§20.2）。
+
+    被管理员隐藏的评论，其作者可提交一次申诉；管理员可采纳（恢复评论）或驳回。
+    每条评论至多一条申诉，由 ``uq_comment_appeals_comment`` 唯一约束保证。
+    ``revision`` 供裁决的乐观并发校验。外键只写字符串表名，不导入 interaction 模型类。
+    """
+
+    __tablename__ = "comment_appeals"
+    __table_args__ = (
+        _enum_check("status", AppealStatus, "status_valid"),
+        UniqueConstraint("comment_id", name="uq_comment_appeals_comment"),
+        Index("ix_comment_appeals_status_created", "status", "created_at"),
+    )
+
+    comment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("comments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    resource_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("resources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    appellant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=AppealStatus.PENDING.value, index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    handled_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AuditLog(Base, UUIDPrimaryKey, CreatedAt):

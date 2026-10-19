@@ -62,6 +62,8 @@ async def lookup(
     record = (await db.execute(stmt)).scalar_one_or_none()
     if record is None:
         return None
+    if record.actor_id != actor_id:
+        raise Conflict("该幂等键不属于当前账号", code="IDEMPOTENCY_KEY_REUSED")
     now = datetime.now(timezone.utc)
     expires_at = record.expires_at
     if expires_at.tzinfo is None:

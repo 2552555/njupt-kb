@@ -1,6 +1,7 @@
 'use client';
 
 import { ReactNode, useCallback, useEffect, useId, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 
 interface ModalProps {
@@ -63,9 +64,10 @@ export function Modal({ isOpen, onClose, title, children }: ModalProps) {
     };
   }, [isOpen, handleKeyDown]);
 
-  if (!isOpen) return null;
+  if (!isOpen || typeof document === 'undefined') return null;
 
-  return (
+  // 路由入场动效含 transform；挂到 body，避免 fixed 弹窗被页面容器裁切。
+  return createPortal(
     <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
       <div
         className="fixed inset-0 bg-overlay"
@@ -97,6 +99,7 @@ export function Modal({ isOpen, onClose, title, children }: ModalProps) {
         )}
         <div className="p-6">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

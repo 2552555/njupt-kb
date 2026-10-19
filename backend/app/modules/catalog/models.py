@@ -204,6 +204,7 @@ class Semester(UUIDPrimaryKey, Timestamped, Base):
     __table_args__ = (
         UniqueConstraint("university_id", "academic_year", "season", name="uq_semester"),
         CheckConstraint(_in("season", SemesterSeason), name="season_valid"),
+        CheckConstraint(_in("status", CatalogEntityStatus), name="status_valid"),
     )
 
     university_id: Mapped[uuid.UUID] = mapped_column(
@@ -214,18 +215,29 @@ class Semester(UUIDPrimaryKey, Timestamped, Base):
     season: Mapped[str] = mapped_column(String(10), nullable=False, default=SemesterSeason.FALL.value)
     start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # beta10：软停用学期，停用后不出现在前台选择器，历史开课仍可读。
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=CatalogEntityStatus.ACTIVE.value
+    )
 
 
 class Teacher(UUIDPrimaryKey, Timestamped, Base):
     """仅记录必要公开教学信息，不建教师个人画像（§11.1）。"""
 
     __tablename__ = "teachers"
+    __table_args__ = (
+        CheckConstraint(_in("status", CatalogEntityStatus), name="status_valid"),
+    )
 
     university_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("universities.id"), nullable=False, index=True
     )
     display_name: Mapped[str] = mapped_column(String(100), nullable=False)
     public_profile: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # beta10：软停用教师，停用后不出现在前台选择器，历史开课教师仍可读。
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=CatalogEntityStatus.ACTIVE.value
+    )
 
 
 class CourseOffering(UUIDPrimaryKey, Timestamped, Base):

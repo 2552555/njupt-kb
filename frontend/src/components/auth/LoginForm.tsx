@@ -21,12 +21,20 @@ export function LoginForm() {
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [otp, setOtp] = useState('');
   const [showReset, setShowReset] = useState(false);
 
   const loginMutation = useMutation({
-    mutationFn: () => login(email.trim(), password),
+    mutationFn: () => login(email.trim(), password, otp.trim() || undefined),
     onSuccess: () => {
-      const target = nextPath && nextPath.startsWith('/') ? nextPath : '/';
+      let target = '/';
+      if (nextPath && nextPath.startsWith('/') && !nextPath.startsWith('//') && !/[\\\x00-\x1f]/.test(nextPath)) {
+        try {
+          const decoded = decodeURIComponent(nextPath);
+          const resolved = new URL(nextPath, window.location.origin);
+          if (resolved.origin === window.location.origin && !decoded.startsWith('//') && !/[\\\x00-\x1f]/.test(decoded)) target = resolved.pathname + resolved.search + resolved.hash;
+        } catch { /* 无效回跳地址使用首页。 */ }
+      }
       router.replace(target);
     },
   });
@@ -61,7 +69,7 @@ export function LoginForm() {
         <Notice tone="error" title="登录未完成">
           {error.message}
           {error.requestId ? `（请求编号 ${error.requestId}）` : ''}
-          <p className="mt-1">请确认邮箱与密码正确后重试；多次失败会触发限流。</p>
+          <p className="mt-1">请核对登录信息；已启用验证器时还需要有效代码或恢复码。多次失败会触发限流。</p>
         </Notice>
       )}
 
@@ -84,6 +92,8 @@ export function LoginForm() {
           value={password}
           onChange={(event) => setPassword(event.target.value)}
         />
+        <Input label="验证器代码或恢复码（已开启时填写）" name="otp" autoComplete="one-time-code"
+          value={otp} maxLength={64} onChange={event => setOtp(event.target.value)} />
         <Button type="submit" className="w-full" isLoading={loginMutation.isPending}>
           登录
         </Button>
@@ -107,7 +117,7 @@ export function LoginForm() {
           <p className="text-sm text-text-secondary">
             输入注册邮箱，我们会发送重置说明（不区分该邮箱是否已注册）。
           </p>
-          <div className="mt-3">
+          <div className="mt-3 flex flex-wrap items-center gap-3">
             <Button
               variant="secondary"
               onClick={() => {
@@ -121,6 +131,12 @@ export function LoginForm() {
             >
               发送重置说明
             </Button>
+            <Link
+              href="/reset-password"
+              className="text-sm text-text-secondary underline underline-offset-2 hover:text-text-primary"
+            >
+              已有重置令牌
+            </Link>
           </div>
         </div>
       )}

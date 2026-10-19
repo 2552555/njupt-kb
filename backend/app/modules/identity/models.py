@@ -31,7 +31,15 @@ from app.core.enums import (
 )
 from app.db import Base, Timestamped, UUIDPrimaryKey
 
-__all__ = ["User", "UserProfile", "UserIdentity", "Session", "AuthToken"]
+__all__ = [
+    "User",
+    "UserProfile",
+    "UserIdentity",
+    "Session",
+    "AuthToken",
+    "UserMFA",
+    "EmailChangeRequest",
+]
 
 
 def _enum_values(enum_cls: type[Enum]) -> str:
@@ -61,6 +69,14 @@ class User(Base, UUIDPrimaryKey, Timestamped):
     email_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # 注销时刻。注销立即生效（不可登录、公开资料匿名化）；邮箱与审计/业务事实
+    # 按保留期继续保留，供申诉与对账，期满由运维清理（§9「注销账号」）。
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 保留期清理时刻。保留期届满后运维任务将邮箱等 PII 置为墓碑并打上本时间戳；
+    # 不删除用户行与业务记录，仅抹除可识别个人信息（§9）。
+    purged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
     # selectin 预加载：display_name_of(user) 与 /me 需要在不触发异步懒加载的前提下读取档案。
     profile: Mapped["UserProfile | None"] = relationship(
@@ -81,6 +97,8 @@ class UserProfile(Base, UUIDPrimaryKey, Timestamped):
     )
     display_name: Mapped[str] = mapped_column(String(80), nullable=False)
     avatar_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    gender: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    bio: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # 学院/专业归属 catalog 模块，这里只保存引用，不复制目录事实。
     college_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("colleges.id"), nullable=True
@@ -135,6 +153,20 @@ class Session(Base, UUIDPrimaryKey, Timestamped):
     revoke_reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(400), nullable=True)
     client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mfa_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UserMFA(Base, Timestamped):
+    """验证器种子只存认证密文；恢复码只存摘要，成功使用后立即移除。"""
+    __tablename__ = "user_mfa"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    secret_ciphertext: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    setup_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_counter: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recovery_hashes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
 
 class AuthToken(Base, UUIDPrimaryKey, Timestamped):
@@ -155,3 +187,25 @@ class AuthToken(Base, UUIDPrimaryKey, Timestamped):
     )
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class EmailChangeRequest(Base, UUIDPrimaryKey, Timestamped):
+    """邮箱换绑申请（0.0.3）。
+
+    双确认：必须同时持有当前密码（发起时校验）与新邮箱收到的令牌（确认时校验）。
+    只存令牌摘要，不存明文；新邮箱在确认前不写入 `users.email`。
+    """
+
+    __tablename__ = "email_change_requests"
+    __table_args__ = (
+        UniqueConstraint("token_digest", name="uq_email_change_requests_token_digest"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    new_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    token_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

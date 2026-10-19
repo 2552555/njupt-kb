@@ -1,28 +1,36 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import { useEffect, useRef, useState } from 'react';
 import {
+  Award,
   Bell,
   BookOpen,
   ChevronDown,
   FileUp,
+  Gavel,
   Heart,
   Home,
   LogOut,
+  ScrollText,
   Search,
+  MessageSquare,
   ShieldCheck,
   UserCog,
+  UserPlus,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/Button';
-import { canReview, useAuthStore } from '@/stores/authStore';
+import { Avatar } from '@/components/common/Avatar';
+import { NotificationBell } from '@/components/layout/NotificationBell';
+import { canAccessAdmin, useAuthStore } from '@/stores/authStore';
 
 const mainNav = [
   { href: '/', label: '首页', icon: Home },
   { href: '/courses', label: '课程', icon: BookOpen },
   { href: '/search', label: '搜索', icon: Search },
+  { href: '/requests', label: '求资料', icon: MessageSquare },
 ];
 
 function isActive(pathname: string, href: string): boolean {
@@ -32,18 +40,17 @@ function isActive(pathname: string, href: string): boolean {
 
 export function AppHeader() {
   const pathname = usePathname();
+  const router = useRouter();
   const { user, status, logout } = useAuthStore();
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPath, setMenuPath] = useState<string | null>(null);
+  const menuOpen = menuPath === pathname;
+  const setMenuOpen = (open: boolean) => setMenuPath(open ? pathname : null);
   const menuRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    setMenuOpen(false);
-  }, [pathname]);
 
   useEffect(() => {
     function onDocClick(event: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
-        setMenuOpen(false);
+        setMenuPath(null);
       }
     }
     document.addEventListener('mousedown', onDocClick);
@@ -61,12 +68,15 @@ export function AppHeader() {
         跳到主要内容
       </a>
       <div className="mx-auto flex h-15 max-w-6xl items-center gap-4 px-4">
-        <Link href="/" className="flex shrink-0 items-center gap-2">
-          <span className="grid h-9 w-9 place-items-center bg-brand text-base font-semibold text-on-color">
-            邮
-          </span>
-          <span className="dn-display hidden text-lg text-text-primary sm:block">
-            南邮课程知识平台
+        <Link href="/" className="flex shrink-0 items-center gap-2" aria-label="南邮课程知识平台 · 返回首页">
+          {/* 品牌标识用排版而非图标：校方徽标未获授权前不虚构校徽（DESIGN.md §3）。 */}
+          <span className="flex flex-col leading-none">
+            <span className="text-[0.5625rem] font-semibold tracking-[0.22em] text-text-secondary">
+              南京邮电大学
+            </span>
+            <span className="dn-display mt-1 text-base text-text-primary sm:text-lg">
+              课程知识平台
+            </span>
           </span>
         </Link>
 
@@ -93,26 +103,25 @@ export function AppHeader() {
         </nav>
 
         <div className="ml-auto flex items-center gap-2">
+          <Link
+            href="/upload"
+            className="hidden min-h-11 items-center gap-2 bg-brand px-3 text-sm font-medium text-on-color hover:bg-brand/90 lg:inline-flex"
+          >
+            <FileUp className="h-4 w-4" aria-hidden="true" />
+            上传资料
+          </Link>
           {authed ? (
             <>
-              <Link
-                href="/upload"
-                className="hidden min-h-11 items-center gap-2 bg-brand px-4 text-sm font-medium text-on-color hover:bg-brand/90 sm:inline-flex"
-              >
-                <FileUp className="h-4 w-4" aria-hidden="true" />
-                上传资料
-              </Link>
+              <NotificationBell />
               <div className="relative" ref={menuRef}>
                 <button
                   type="button"
-                  onClick={() => setMenuOpen((open) => !open)}
+                  onClick={() => setMenuOpen(!menuOpen)}
                   aria-expanded={menuOpen}
                   aria-haspopup="menu"
                   className="flex min-h-11 items-center gap-2 px-2 text-sm text-text-primary hover:bg-canvas"
                 >
-                  <span className="grid h-8 w-8 place-items-center bg-ink text-sm font-medium text-on-ink">
-                    {user.display_name?.charAt(0) || 'U'}
-                  </span>
+                  <Avatar url={user.avatar_url} name={user.display_name} />
                   <ChevronDown className="h-4 w-4 text-text-secondary" aria-hidden="true" />
                   <span className="sr-only">账号菜单</span>
                 </button>
@@ -133,12 +142,20 @@ export function AppHeader() {
                         </p>
                       )}
                     </div>
+                    <MenuLink href="/me" icon={UserCog} label="个人总览" />
                     <MenuLink href="/me/resources" icon={BookOpen} label="我的资料" />
+                    <MenuLink href="/me/contributions" icon={Award} label="我的贡献" />
+                    <MenuLink href="/me/guides" icon={BookOpen} label="我的攻略" />
+                    <MenuLink href="/me/contributor-application" icon={UserPlus} label="入驻申请" />
+                    <MenuLink href="/me/cases" icon={Gavel} label="我的案件" />
+                    <MenuLink href="/me/agreements" icon={ScrollText} label="我的协议" />
+                    <MenuLink href="/me/profile" icon={UserCog} label="个人资料" />
                     <MenuLink href="/me/favorites" icon={Heart} label="我的收藏" />
+                    <MenuLink href="/me/follows" icon={BookOpen} label="我的关注" />
                     <MenuLink href="/me/notifications" icon={Bell} label="通知" />
                     <MenuLink href="/me/security" icon={UserCog} label="账号与安全" />
-                    {canReview(user) && (
-                      <MenuLink href="/admin/reviews" icon={ShieldCheck} label="审核后台" />
+                    {canAccessAdmin(user) && (
+                      <MenuLink href="/admin" icon={ShieldCheck} label="管理后台" />
                     )}
                     <button
                       type="button"
@@ -160,7 +177,8 @@ export function AppHeader() {
             <Button
               variant="primary"
               onClick={() => {
-                window.location.assign('/login');
+                const next = pathname === '/login' ? '/' : pathname + window.location.search;
+                router.push(`/login?next=${encodeURIComponent(next)}`);
               }}
             >
               登录

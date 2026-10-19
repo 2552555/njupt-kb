@@ -1,11 +1,3 @@
-/**
- * 站内通知接口（设计文档 §21、§25.2）。
- *
- * 注意：后端 notification 模块尚未在本分支落地（main.py 已预留 include_router）。
- * 本客户端按 §25.2 的 `GET /notifications`、`PATCH /notifications/{id}` 契约编写，
- * 字段以最小必要集为准；后端 DTO 就绪后需核对 `NotificationItem`。
- * 页面在接口不可用时必须显示明确不可用状态，不编造未读数。
- */
 import { api } from './client';
 import type { CursorPage, NotificationType } from './types';
 
@@ -15,7 +7,8 @@ export interface NotificationItem {
   title: string;
   body: string;
   data: Record<string, unknown> | null;
-  read: boolean;
+  is_read: boolean;
+  read_at: string | null;
   created_at: string;
 }
 
@@ -34,4 +27,18 @@ export async function setNotificationRead(
   read: boolean,
 ): Promise<void> {
   await api.patch(`/notifications/${notificationId}`, { read });
+}
+
+export async function markAllNotificationsRead(): Promise<{updated:number}> {
+  return (await api.post('/notifications/read-all')).data;
+}
+
+export interface UnreadCount {
+  unread: number;
+}
+
+/** 未读数：SSE 不可用时作为轮询兜底（beta16 §33）。 */
+export async function fetchUnreadCount(): Promise<UnreadCount> {
+  const { data } = await api.get<UnreadCount>('/notifications/unread-count');
+  return data;
 }

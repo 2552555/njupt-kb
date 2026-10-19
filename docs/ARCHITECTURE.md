@@ -1,4 +1,8 @@
-# 实现契约（0.0.1bate2）
+# 实现契约（0.0.1-beta.3）
+
+beta3 以原 `0.0.1bate2` 设计为基线继续实现。新增 `content/management.py` 与
+`management_router.py` 承担作者和审核工作区，`access/visibility.py` 提供数据库可见性筛选。
+公开读取和作者修改分开；审核工作权限不授予修改作者草稿的权限。
 
 本文件是《南邮课程知识平台_系统设计_0.0.1bate2》的**代码级落地契约**。
 设计文档管业务规则，本文件管文件位置、命名、跨模块接口与不可协商的约定。
@@ -46,6 +50,10 @@ nginx/nginx.conf               [冻结]
 | jobs | `app/modules/jobs` | `/admin/jobs` |
 | commerce | `app/modules/commerce` | `/orders`、`/admin/refunds`、`/admin/reconciliations` |
 | creator | `app/modules/creator` | `/creators`、`/me/contributions`、`/me/ledger`、`/me/withdrawals` |
+| assignment | `app/modules/assignment` | `/admin/permission-assignments`、`/admin/resource-assignments`、`/me/assignments`（beta15） |
+| cases | `app/modules/cases` | `/cases`、`/me/cases`、`/rights-notices`、`/admin/cases`（beta15） |
+| licensing | `app/modules/licensing` | `/me/agreements`、`/agreements`、`/price-proposals`、`/admin/agreements`（beta15，商业化关闭） |
+| settlement | `app/modules/settlement` | `/me/settlement-statements`、`/admin/settlement-statements`、`/admin/payouts`（beta15，商业化关闭） |
 | ai | `app/modules/ai` | `/ai` |
 
 `main.py` 按固定顺序 `from app.modules.<name>.router import router as <name>_router` 并 `include_router(router, prefix="/api/v1")`。

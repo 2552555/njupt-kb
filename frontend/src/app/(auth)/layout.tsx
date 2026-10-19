@@ -14,12 +14,10 @@ export default function AuthLayout({ children }: { children: React.ReactNode }) 
         <div>
           <p className="dn-kicker">NJUPT COURSE KNOWLEDGE</p>
           <h1 className="dn-display mt-3 text-4xl">
-            以课程为线索，
-            <br />
-            找到可追溯的学习资料
+            课程资料
           </h1>
           <p className="mt-4 max-w-sm text-on-color">
-            按课程、学期与资料类型查找内容，查看适用范围与预览，再按权限阅读或下载。
+            笔记、试卷、课件与复习资料
           </p>
         </div>
         <p className="text-sm text-on-color">

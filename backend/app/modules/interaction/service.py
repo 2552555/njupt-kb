@@ -9,10 +9,23 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
 
-from sqlalchemy import bindparam, delete, func, or_, select, text
+from sqlalchemy import (
+    DateTime,
+    String,
+    Text,
+    and_,
+    bindparam,
+    column,
+    delete,
+    func,
+    or_,
+    select,
+    table,
+    text,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,11 +34,12 @@ from app.core.enums import (
     ContributionKind,
     CorrectionStatus,
     DomainEventType,
-    NotificationType,
     RequestStatus,
+    ResourceType,
 )
-from app.core.errors import Forbidden, InvalidInput, NotFound
+from app.core.errors import Conflict, Forbidden, InvalidInput, NotFound
 from app.core.events import emit_event
+from app.core.permissions import COMMENT_MODERATE, effective_permissions
 from app.core.pagination import (
     CursorPage,
     decode_cursor,
@@ -64,6 +78,10 @@ RATING_CONFIDENCE_C = 5.0
 _WHITESPACE = re.compile(r"\s+")
 _LIKE_ESCAPE = "\\"
 
+# 资料需求榜（sort=hot）只统计近 7 天创建的开放需求：超过窗口的需求自然沉底，
+# 避免“关注数最高的老需求”长期占据榜单（beta14 排序与推荐信号）。
+REQUEST_HOT_WINDOW_DAYS = 7
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -76,6 +94,29 @@ def _normalize_text(value: str) -> str:
 
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _as_uuid(value: Any) -> uuid.UUID:
+    """把裸 SQL 读回的 uuid 列值统一成 UUID 对象。
+
+    PostgreSQL 的 native uuid 列由驱动返回 UUID；SQLite 以 CHAR(32) 存储无连字符
+    字符串，读回是 str。下游（如 expanding bindparam 的 Uuid 类型）要求 UUID 对象。
+    """
+    return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+
+def _like_fragments(db: AsyncSession) -> tuple[str, str]:
+    """按方言返回 (大小写不敏感匹配运算符, 年份提取表达式)。
+
+    PostgreSQL 用 `ILIKE` / `EXTRACT`；SQLite（本地开发与测试库）没有这两个语法，
+    这里用等价物替换：SQLite 的 `LIKE` 对 ASCII 本就大小写不敏感（中文无大小写），
+    年份用 `strftime` 提取后再 CAST 成整数，行为与 `EXTRACT` 一致。
+    """
+    bind = db.get_bind()
+    dialect = bind.dialect.name if bind is not None else "postgresql"
+    if dialect == "sqlite":
+        return "LIKE", "CAST(strftime('%Y', start_date) AS INTEGER)"
+    return "ILIKE", "EXTRACT(YEAR FROM start_date)"
 
 
 # =====================================================================
@@ -91,11 +132,17 @@ async def has_access_history(
     依据 download_grants / preview_grants 的实际发放记录判断，避免未接触内容的匿名刷分。
     access 模块未声明"查询历史"接口，这里只读其表，不导入对方模型类。
     """
+    from sqlalchemy import Uuid
+
     stmt = text(
         "SELECT 1 FROM download_grants WHERE user_id = :uid AND resource_id = :rid "
         "UNION ALL "
         "SELECT 1 FROM preview_grants WHERE user_id = :uid AND resource_id = :rid "
         "LIMIT 1"
+    ).bindparams(
+        # UUID 参数声明类型：SQLite 的 DBAPI 不接受 uuid.UUID 对象（见 search() 内注释）。
+        bindparam("uid", type_=Uuid()),
+        bindparam("rid", type_=Uuid()),
     )
     row = (await db.execute(stmt, {"uid": user_id, "rid": resource_id})).first()
     return row is not None
@@ -423,11 +470,9 @@ async def list_comments(
     resource_id: uuid.UUID,
     cursor: str | None,
     limit: int | None,
+    user=None,
 ) -> CursorPage[CommentItem]:
-    from app.modules.content.service import assert_visible, get_resource
-
-    resource = await get_resource(db, resource_id)
-    await assert_visible(db, resource)
+    await assert_comment_resource(db, resource_id=resource_id, user=user)
 
     page_size = normalize_page_size(limit)
     stmt = select(Comment).where(Comment.resource_id == resource_id)
@@ -445,7 +490,7 @@ async def list_comments(
     has_more = len(rows) > page_size
     rows = rows[:page_size]
 
-    items = await _comment_items(db, rows)
+    items = await _comment_items(db, rows, viewer=user)
     next_cursor = (
         encode_cursor({"t": rows[-1].created_at.isoformat(), "i": str(rows[-1].id)})
         if has_more and rows
@@ -463,17 +508,25 @@ async def create_comment(
     parent_id: uuid.UUID | None,
 ) -> CommentItem:
     """新增评论或回复。body 以纯文本存储，不作为任意 HTML 执行（§28）。"""
-    from app.modules.content.service import assert_visible, get_resource
+    from app.core.enums import AccountStatus
+    from app.modules.identity.service import get_user
 
-    resource = await get_resource(db, resource_id)
-    await assert_visible(db, resource)
+    user = await get_user(db, user_id)
+    if user.status != AccountStatus.ACTIVE:
+        raise Forbidden("当前账号不能发表评论")
+    await assert_comment_resource(db, resource_id=resource_id, user=user)
 
     if parent_id is not None:
         parent = (
-            await db.execute(select(Comment).where(Comment.id == parent_id))
+            await db.execute(select(Comment).where(Comment.id == parent_id)
+                             .with_for_update().execution_options(populate_existing=True))
         ).scalar_one_or_none()
         if parent is None or parent.resource_id != resource_id:
             raise InvalidInput("回复目标无效", details={"parent_id": str(parent_id)})
+        if parent.withdrawn_at is not None or parent.is_hidden:
+            raise Conflict("该评论已撤回或隐藏，不能继续回复")
+        if parent.parent_id is not None:
+            raise InvalidInput("仅支持回复主评论")
 
     comment = Comment(
         resource_id=resource_id, user_id=user_id, parent_id=parent_id, body=body
@@ -484,16 +537,25 @@ async def create_comment(
     return items[0]
 
 
-async def _comment_items(db: AsyncSession, comments: list[Comment]) -> list[CommentItem]:
+async def _comment_items(
+    db: AsyncSession, comments: list[Comment], viewer=None
+) -> list[CommentItem]:
     from app.modules.identity.service import display_name_of, get_users
 
     if not comments:
         return []
     users = await get_users(db, [c.user_id for c in comments])
+    hidden = [c for c in comments if c.is_hidden and c.withdrawn_at is None]
+    reasons = await _hide_reasons(db, [c.id for c in hidden]) if hidden else {}
     items: list[CommentItem] = []
+    can_moderate = viewer is not None and COMMENT_MODERATE in await effective_permissions(db, viewer)
     for comment in comments:
         user = users.get(comment.user_id)
         name = display_name_of(user) if user is not None else "已注销用户"
+        moderation_reason = None
+        if viewer is not None and comment.is_hidden and comment.withdrawn_at is None:
+            if viewer.id == comment.user_id or can_moderate:
+                moderation_reason = reasons.get(comment.id)
         items.append(
             CommentItem(
                 id=comment.id,
@@ -501,11 +563,70 @@ async def _comment_items(db: AsyncSession, comments: list[Comment]) -> list[Comm
                 user_id=comment.user_id,
                 display_name=name,
                 parent_id=comment.parent_id,
-                body=comment.body,
+                body=comment.body if comment.withdrawn_at is None and not comment.is_hidden else None,
                 created_at=comment.created_at,
+                status=comment_status(comment),
+                revision=comment.revision,
+                moderation_reason=moderation_reason,
             )
         )
     return items
+
+
+async def _hide_reasons(
+    db: AsyncSession, comment_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    """批量读取评论最近一次被隐藏的处理理由。
+
+    只读 moderation 拥有的 `audit_logs`（不导入对方模型类），不复制评论正文。
+    """
+    audit = table(
+        "audit_logs",
+        column("object_id", String(64)),
+        column("object_type", String(60)),
+        column("action", String(80)),
+        column("reason", Text),
+        column("created_at", DateTime(timezone=True)),
+    )
+    rows = await db.execute(
+        select(audit.c.object_id, audit.c.reason)
+        .where(
+            audit.c.object_type == "comment",
+            audit.c.action == "comment.hidden",
+            audit.c.object_id.in_([str(i) for i in comment_ids]),
+        )
+        .order_by(audit.c.created_at.desc())
+    )
+    result: dict[uuid.UUID, str] = {}
+    for object_id, reason in rows:
+        if not reason:
+            continue
+        try:
+            key = uuid.UUID(str(object_id))
+        except (TypeError, ValueError):
+            continue
+        result.setdefault(key, reason)
+    return result
+
+
+def comment_status(comment: Comment) -> Literal["visible", "withdrawn", "hidden"]:
+    if comment.withdrawn_at is not None:
+        return "withdrawn"
+    return "hidden" if comment.is_hidden else "visible"
+
+
+async def assert_comment_resource(db: AsyncSession, *, resource_id: uuid.UUID, user) -> None:
+    from app.core.enums import Capability
+    from app.modules.content.service import assert_visible, get_resource
+    from app.modules.access.service import authorize
+
+    resource = await get_resource(db, resource_id)
+    await assert_visible(db, resource)
+    try:
+        await authorize(db, user=user, resource_id=resource_id,
+                        version_id=resource.published_version_id, capability=Capability.READ_METADATA)
+    except Forbidden as exc:
+        raise NotFound("资源不存在") from exc
 
 
 # =====================================================================
@@ -520,6 +641,8 @@ def _correction_item(correction: Correction) -> CorrectionItem:
         version_id=correction.version_id,
         submitter_id=correction.submitter_id,
         description=correction.description,
+        suggested_course_id=correction.suggested_course_id,
+        suggested_resource_type=correction.suggested_resource_type,
         status=CorrectionStatus(correction.status),
         resolution_note=correction.resolution_note,
         fixed_version_id=correction.fixed_version_id,
@@ -537,6 +660,8 @@ async def create_correction(
     resource_id: uuid.UUID,
     version_id: uuid.UUID,
     description: str,
+    suggested_course_id: uuid.UUID | None = None,
+    suggested_resource_type: ResourceType | None = None,
 ) -> CorrectionItem:
     """纠错工单绑定版本；新版本修复后由管理员关联工单并通知提交者（§20.2）。"""
     from app.modules.content.service import assert_visible, get_resource, get_version
@@ -546,6 +671,18 @@ async def create_correction(
     version = await get_version(db, version_id)
     if version.resource_id != resource_id:
         raise InvalidInput("版本不属于该资源", details={"version_id": str(version_id)})
+    from app.modules.identity.service import get_user
+    from app.modules.access.service import authorize
+    from app.core.enums import Capability
+
+    user = await get_user(db, user_id)
+    await authorize(db, user=user, resource_id=resource_id, version_id=version_id,
+                    capability=Capability.READ_METADATA)
+    if resource.published_version_id != version_id:
+        raise InvalidInput("只能对当前公开版本提交纠错")
+    if suggested_course_id is not None:
+        from app.modules.catalog.service import get_course
+        await get_course(db, suggested_course_id)
 
     correction = Correction(
         resource_id=resource_id,
@@ -553,6 +690,8 @@ async def create_correction(
         submitter_id=user_id,
         description=description,
         status=CorrectionStatus.OPEN.value,
+        suggested_course_id=suggested_course_id,
+        suggested_resource_type=suggested_resource_type.value if suggested_resource_type else None,
     )
     db.add(correction)
     await db.flush()
@@ -603,6 +742,41 @@ async def list_my_corrections(
     )
 
 
+async def list_corrections(
+    db: AsyncSession,
+    *,
+    status: CorrectionStatus | None,
+    cursor: str | None,
+    limit: int | None,
+) -> CursorPage[CorrectionItem]:
+    """管理端纠错工单列表；与 list_my_corrections 的区别只是不限定提交人。"""
+    page_size = normalize_page_size(limit)
+    stmt = select(Correction)
+    if status is not None:
+        stmt = stmt.where(Correction.status == status.value)
+    decoded = _decode_time_cursor(cursor)
+    if decoded is not None:
+        created_at, last_id = decoded
+        stmt = stmt.where(
+            or_(
+                Correction.created_at < created_at,
+                (Correction.created_at == created_at) & (Correction.id < last_id),
+            )
+        )
+    stmt = stmt.order_by(Correction.created_at.desc(), Correction.id.desc()).limit(page_size + 1)
+    rows = list((await db.execute(stmt)).scalars().all())
+    has_more = len(rows) > page_size
+    rows = rows[:page_size]
+    next_cursor = (
+        encode_cursor({"t": rows[-1].created_at.isoformat(), "i": str(rows[-1].id)})
+        if has_more and rows
+        else None
+    )
+    return CursorPage(
+        items=[_correction_item(c) for c in rows], next_cursor=next_cursor, has_more=has_more
+    )
+
+
 async def update_correction_status(
     db: AsyncSession,
     *,
@@ -615,7 +789,7 @@ async def update_correction_status(
 ) -> CorrectionItem:
     """管理员处理纠错工单。主动纠正错误获得正向认可，不惩罚被纠错的贡献者（§20.2、§37）。"""
     correction = (
-        await db.execute(select(Correction).where(Correction.id == correction_id))
+        await db.execute(select(Correction).where(Correction.id == correction_id).with_for_update())
     ).scalar_one_or_none()
     if correction is None:
         raise NotFound("纠错工单不存在")
@@ -628,6 +802,8 @@ async def update_correction_status(
             raise InvalidInput("修复版本不属于该资源", details={"fixed_version_id": str(fixed_version_id)})
 
     previous = CorrectionStatus(correction.status)
+    if previous == status:
+        return _correction_item(correction)
     correction.status = status.value
     if resolution_note is not None:
         correction.resolution_note = resolution_note
@@ -651,18 +827,40 @@ async def update_correction_status(
     rewardable = (CorrectionStatus.ACCEPTED, CorrectionStatus.FIXED)
     if status in rewardable and previous not in rewardable:
         await _reward_correction(db, correction)
-        await _notify_correction_result(db, correction, status)
-
     await emit_event(
         db,
         event_type=DomainEventType.CORRECTION_RESOLVED,
         subject_type="correction",
         subject_id=correction.id,
-        payload={"status": status.value, "submitter_id": str(correction.submitter_id)},
+        payload={"status": status.value, "submitter_id": str(correction.submitter_id), "handled_by": str(actor_id)},
         dedupe_key=f"correction.resolved:{correction.id}:{status.value}",
     )
     await db.flush()
+    await db.refresh(correction)
     return _correction_item(correction)
+
+
+async def apply_classification_fix(db, *, correction_id, actor_id, expected_revision, resolution_note, request_id):
+    from app.modules.content.service import correct_classification
+
+    correction = (await db.execute(select(Correction).where(
+        Correction.id == correction_id).with_for_update())).scalar_one_or_none()
+    if correction is None:
+        raise NotFound("纠错工单不存在")
+    if correction.status not in ("open", "accepted"):
+        raise Conflict("该工单已结案")
+    if correction.suggested_course_id is None and correction.suggested_resource_type is None:
+        raise InvalidInput("该工单没有分类建议")
+    await correct_classification(
+        db, resource_id=correction.resource_id, version_id=correction.version_id,
+        course_id=correction.suggested_course_id, resource_type=correction.suggested_resource_type,
+        expected_revision=expected_revision, actor_id=actor_id, reason=resolution_note,
+        request_id=request_id,
+    )
+    return await update_correction_status(
+        db, correction_id=correction_id, actor_id=actor_id, status=CorrectionStatus.FIXED,
+        resolution_note=resolution_note, fixed_version_id=None, request_id=request_id,
+    )
 
 
 async def _reward_correction(db: AsyncSession, correction: Correction) -> None:
@@ -676,21 +874,6 @@ async def _reward_correction(db: AsyncSession, correction: Correction) -> None:
         reference_type="correction",
         reference_id=correction.id,
         note="纠错被采纳",
-    )
-
-
-async def _notify_correction_result(
-    db: AsyncSession, correction: Correction, status: CorrectionStatus
-) -> None:
-    from app.modules.notification.service import notify
-
-    await notify(
-        db,
-        user_id=correction.submitter_id,
-        type=NotificationType.CORRECTION_RESULT,
-        title="你的纠错有了处理结果",
-        body=f"纠错工单状态已更新为：{status.value}",
-        data={"correction_id": str(correction.id), "status": status.value},
     )
 
 
@@ -729,10 +912,26 @@ async def _ensure_request_follow(
     )
 
 
+async def request_followers(db, request_id):
+    return list((await db.scalars(select(ResourceRequestFollow.user_id).where(ResourceRequestFollow.request_id == request_id))).all())
+
+
 async def _request_item(
-    db: AsyncSession, request: ResourceRequest, follower_count: int | None = None
+    db: AsyncSession,
+    request: ResourceRequest,
+    follower_count: int | None = None,
+    resolution=None,
+    viewer=None,
 ) -> RequestItem:
     count = follower_count if follower_count is not None else await _follower_count(db, request.id)
+    from app.modules.interaction.request_management import resolution_summary
+    resource_id, resource_title = (
+        resolution
+        if resolution is not None
+        else await resolution_summary(
+            db, request.resolved_resource_id, request.course_id, user=viewer
+        )
+    )
     return RequestItem(
         id=request.id,
         course_id=request.course_id,
@@ -740,8 +939,11 @@ async def _request_item(
         description=request.description,
         status=request.status,
         follower_count=count,
-        resolved_resource_id=request.resolved_resource_id,
+        resolved_resource_id=resource_id,
         created_at=request.created_at,
+        requester_id=request.requester_id, revision=request.revision, handled_at=request.handled_at,
+        resolution_available=resource_id is not None, resolved_resource_title=resource_title,
+        resolved_resource_accessible=resource_id is not None,
     )
 
 
@@ -801,7 +1003,16 @@ async def list_requests(
     status: str | None,
     cursor: str | None,
     limit: int | None,
+    viewer=None,
+    sort: str = "latest",
 ) -> CursorPage[RequestItem]:
+    """需求列表。``sort=latest`` 按创建时间倒序（默认，行为不变）；
+
+    ``sort=hot`` 为资料需求榜：近 7 天创建的开放需求，按关注人数降序 + id 降序，
+    游标键与 latest 不同（follower_count/id），两种排序的游标不可混用。
+    """
+    if sort not in ("latest", "hot"):
+        raise InvalidInput("不支持的排序方式", details={"allowed": ["latest", "hot"]})
     page_size = normalize_page_size(limit)
     follower_count = (
         select(func.count(ResourceRequestFollow.id))
@@ -816,31 +1027,63 @@ async def list_requests(
             stmt = stmt.where(ResourceRequest.status == RequestStatus(status).value)
         except ValueError as exc:
             raise InvalidInput("需求状态无效", details={"status": status}) from exc
-    decoded = _decode_time_cursor(cursor)
-    if decoded is not None:
-        created_at, last_id = decoded
+    if sort == "hot":
+        # 热点窗口与「开放」约束先于游标过滤，保证翻页边界稳定。
+        cutoff = _now() - timedelta(days=REQUEST_HOT_WINDOW_DAYS)
         stmt = stmt.where(
-            or_(
-                ResourceRequest.created_at < created_at,
-                (ResourceRequest.created_at == created_at) & (ResourceRequest.id < last_id),
-            )
+            ResourceRequest.created_at >= cutoff,
+            ResourceRequest.status == RequestStatus.OPEN.value,
         )
-    stmt = stmt.order_by(
-        ResourceRequest.created_at.desc(), ResourceRequest.id.desc()
-    ).limit(page_size + 1)
+        decoded = _decode_hot_cursor(cursor)
+        if decoded is not None:
+            last_followers, last_id = decoded
+            stmt = stmt.where(
+                or_(
+                    follower_count < last_followers,
+                    and_(follower_count == last_followers, ResourceRequest.id < last_id),
+                )
+            )
+        stmt = stmt.order_by(follower_count.desc(), ResourceRequest.id.desc())
+    else:
+        decoded = _decode_time_cursor(cursor)
+        if decoded is not None:
+            created_at, last_id = decoded
+            stmt = stmt.where(
+                or_(
+                    ResourceRequest.created_at < created_at,
+                    (ResourceRequest.created_at == created_at) & (ResourceRequest.id < last_id),
+                )
+            )
+        stmt = stmt.order_by(
+            ResourceRequest.created_at.desc(), ResourceRequest.id.desc()
+        )
+    stmt = stmt.limit(page_size + 1)
     rows = list((await db.execute(stmt)).all())
     has_more = len(rows) > page_size
     rows = rows[:page_size]
 
+    from app.modules.interaction.request_management import public_summaries
+    summaries = await public_summaries(
+        db, [(r.resolved_resource_id, r.course_id) for r, _ in rows], user=viewer
+    )
     items = [
-        await _request_item(db, request, follower_count=int(count or 0))
+        await _request_item(db, request, follower_count=int(count or 0), resolution=summaries.get((request.resolved_resource_id, request.course_id), (None, None)))
         for request, count in rows
     ]
-    next_cursor = (
-        encode_cursor({"t": rows[-1][0].created_at.isoformat(), "i": str(rows[-1][0].id)})
-        if has_more and rows
-        else None
-    )
+    if sort == "hot":
+        # 热门游标只带 follower_count 与 id：latest 游标缺 f 键、热门游标缺 t 键，
+        # 任一方误用都会在解码处报「cursor 无效」，不会静默串页。
+        next_cursor = (
+            encode_cursor({"f": int(rows[-1][1] or 0), "i": str(rows[-1][0].id)})
+            if has_more and rows
+            else None
+        )
+    else:
+        next_cursor = (
+            encode_cursor({"t": rows[-1][0].created_at.isoformat(), "i": str(rows[-1][0].id)})
+            if has_more and rows
+            else None
+        )
     return CursorPage(items=items, next_cursor=next_cursor, has_more=has_more)
 
 
@@ -850,6 +1093,7 @@ async def list_my_requests(
     user_id: uuid.UUID,
     cursor: str | None,
     limit: int | None,
+    viewer=None,
 ) -> CursorPage[RequestItem]:
     page_size = normalize_page_size(limit)
     follower_count = (
@@ -875,8 +1119,12 @@ async def list_my_requests(
     rows = list((await db.execute(stmt)).all())
     has_more = len(rows) > page_size
     rows = rows[:page_size]
+    from app.modules.interaction.request_management import public_summaries
+    summaries = await public_summaries(
+        db, [(r.resolved_resource_id, r.course_id) for r, _ in rows], user=viewer
+    )
     items = [
-        await _request_item(db, request, follower_count=int(count or 0))
+        await _request_item(db, request, follower_count=int(count or 0), resolution=summaries.get((request.resolved_resource_id, request.course_id), (None, None)))
         for request, count in rows
     ]
     next_cursor = (
@@ -913,23 +1161,35 @@ async def _match_course_ids(db: AsyncSession, query: str) -> list[uuid.UUID]:
 
 
 async def _course_ids_of_curriculum(db: AsyncSession, curriculum_id: uuid.UUID) -> set[uuid.UUID]:
+    from sqlalchemy import Uuid
+
     rows = await db.execute(
-        text("SELECT course_id FROM curriculum_courses WHERE curriculum_id = :cid"),
+        text("SELECT course_id FROM curriculum_courses WHERE curriculum_id = :cid").bindparams(
+            bindparam("cid", type_=Uuid())
+        ),
         {"cid": curriculum_id},
     )
-    return {row[0] for row in rows}
+    # SQLite 的 uuid 列以无连字符字符串存储，裸 SQL 读回的是 str；统一转回 UUID，
+    # 让调用方（含 expanding bindparam 的类型化绑定）拿到一致的对象。
+    return {_as_uuid(row[0]) for row in rows}
 
 
 async def _course_ids_of_university(db: AsyncSession, university_id: uuid.UUID) -> set[uuid.UUID]:
+    from sqlalchemy import Uuid
+
     rows = await db.execute(
-        text("SELECT id FROM courses WHERE university_id = :uid"), {"uid": university_id}
+        text("SELECT id FROM courses WHERE university_id = :uid").bindparams(
+            bindparam("uid", type_=Uuid())
+        ),
+        {"uid": university_id},
     )
-    return {row[0] for row in rows}
+    return {_as_uuid(row[0]) for row in rows}
 
 
 async def search(
     db: AsyncSession,
     *,
+    user=None,
     q: str | None,
     university_id: uuid.UUID | None,
     curriculum_id: uuid.UUID | None,
@@ -949,6 +1209,7 @@ async def search(
     """
     page_size = normalize_page_size(limit)
     normalized_q = _normalize_text(q) if q else None
+    like_op, year_expr = _like_fragments(db)
 
     params: dict[str, Any] = {}
     expanding: list[str] = []
@@ -980,15 +1241,18 @@ async def search(
             params["q_cids"] = matched_course_ids
             expanding.append("q_cids")
             clauses.append("r.course_id IN :q_cids")
-        clauses.append(f"rv.title ILIKE :title_like ESCAPE '{_LIKE_ESCAPE}'")
+        clauses.append(f"rv.title {like_op} :title_like ESCAPE '{_LIKE_ESCAPE}'")
         clauses.append(
             "EXISTS (SELECT 1 FROM offering_teachers ot "
             "JOIN teachers t ON t.id = ot.teacher_id "
             "WHERE ot.offering_id = r.offering_id "
-            f"AND t.display_name ILIKE :title_like ESCAPE '{_LIKE_ESCAPE}')"
+            f"AND t.display_name {like_op} :title_like ESCAPE '{_LIKE_ESCAPE}')"
         )
         where.append("(" + " OR ".join(clauses) + ")")
-        rank_expr = f"CASE WHEN rv.title ILIKE :title_like ESCAPE '{_LIKE_ESCAPE}' THEN 0 ELSE 1 END"
+        rank_expr = (
+            f"CASE WHEN rv.title {like_op} :title_like ESCAPE '{_LIKE_ESCAPE}' "
+            "THEN 0 ELSE 1 END"
+        )
     else:
         rank_expr = "1"
 
@@ -1006,7 +1270,7 @@ async def search(
         params["applicable_year"] = applicable_year
         where.append(
             "o.semester_id IN ("
-            "SELECT id FROM semesters WHERE EXTRACT(YEAR FROM start_date) = :applicable_year)"
+            f"SELECT id FROM semesters WHERE {year_expr} = :applicable_year)"
         )
     if teacher_id is not None:
         params["teacher_id"] = teacher_id
@@ -1022,7 +1286,6 @@ async def search(
         params["cur_id"] = last_id
         where.append(f"({rank_expr}, r.course_id, r.id) > (:cur_rank, :cur_course_id, :cur_id)")
 
-    params["limit"] = page_size + 1
     sql = f"""
         SELECT r.id, r.course_id, r.resource_type, r.freshness_status,
                r.published_version_id, rv.title, {rank_expr} AS rank
@@ -1031,12 +1294,28 @@ async def search(
         {offering_join}
         WHERE {' AND '.join(where)}
         ORDER BY {rank_expr} ASC, r.course_id ASC, r.id ASC
-        LIMIT :limit
     """
+    from sqlalchemy import Uuid, Integer, String
+    from app.modules.access.visibility import visible_resource_ids
+
+    # Filter before LIMIT so hidden resources cannot create holes or leak via pagination.
+    # 声明 UUID 参数类型：SQLite 的 DBAPI 不认识 uuid.UUID 对象，Uuid 类型会按方言做
+    # 绑定转换（SQLite → CHAR(32) 字符串，PostgreSQL → 原生 uuid），与 ORM 列行为一致。
+    uuid_params = [bindparam(name, expanding=True, type_=Uuid()) for name in expanding]
+    uuid_params += [
+        bindparam(name, type_=Uuid())
+        for name in ("semester_id", "teacher_id", "cur_course_id", "cur_id")
+        if name in params
+    ]
     stmt = text(sql)
-    if expanding:
-        stmt = stmt.bindparams(*(bindparam(name, expanding=True) for name in expanding))
-    rows = list((await db.execute(stmt, params)).all())
+    if uuid_params:
+        stmt = stmt.bindparams(*uuid_params)
+    source = stmt.columns(id=Uuid(), course_id=Uuid(), resource_type=String(),
+                          freshness_status=String(), published_version_id=Uuid(),
+                          title=String(), rank=Integer()).subquery()
+    query = (select(source).where(source.c.id.in_(visible_resource_ids(user)))
+             .order_by(source.c.rank, source.c.course_id, source.c.id).limit(page_size + 1))
+    rows = list((await db.execute(query, params)).all())
 
     has_more = len(rows) > page_size
     rows = rows[:page_size]
@@ -1106,6 +1385,19 @@ def _decode_time_cursor(cursor: str | None) -> tuple[datetime, uuid.UUID] | None
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
     return created_at, last_id
+
+
+def _decode_hot_cursor(cursor: str | None) -> tuple[int, uuid.UUID] | None:
+    """资料需求榜游标：follower_count + id，与 latest 的 created_at + id 键不同，不可混用。"""
+    if not cursor:
+        return None
+    payload = decode_cursor(cursor)
+    try:
+        followers = int(payload["f"])
+        last_id = uuid.UUID(str(payload["i"]))
+    except (KeyError, ValueError, TypeError) as exc:
+        raise InvalidInput("cursor 无效", details={"reason": "malformed"}) from exc
+    return followers, last_id
 
 
 def _decode_search_cursor(cursor: str) -> tuple[int, uuid.UUID, uuid.UUID]:

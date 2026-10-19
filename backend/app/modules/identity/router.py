@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from datetime import date
+
+from fastapi import APIRouter, Depends, File, Query, Request, Response, UploadFile, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -25,17 +28,22 @@ from app.modules.identity.models import Session, User
 from app.modules.identity.schemas import (
     ActionMessage,
     CsrfResponse,
+    DeletionRequest,
+    EmailChangeConfirmRequest,
+    EmailChangeRequestDTO,
     EmailVerificationConfirmRequest,
     EmailVerificationRequest,
     LoginRequest,
     MeResponse,
     MeUpdateRequest,
+    PasswordChangeRequest,
     PasswordResetConfirmRequest,
     PasswordResetRequest,
     RegisterRequest,
     RegisterResponse,
     SessionItem,
 )
+from app.modules.ratelimit.deps import rate_limit
 
 router = APIRouter(tags=["identity"])
 
@@ -129,11 +137,13 @@ async def login(
     response: Response,
     db: AsyncSession = Depends(get_db),
     request_id: str = Depends(get_request_id),
+    _rl: None = Depends(rate_limit("login")),
 ) -> MeResponse:
     user, raw_token, _expires_at = await service.login(
         db,
         email=payload.email,
         password=payload.password,
+        otp=payload.otp,
         user_agent=request.headers.get("User-Agent"),
         client_ip=get_client_ip(request),
         request_id=request_id,
@@ -215,6 +225,25 @@ async def update_me(
     )
 
 
+@router.post("/me/avatar", response_model=MeResponse)
+async def upload_avatar(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    _session: Session = Depends(current_session),
+    db: AsyncSession = Depends(get_db),
+    request_id: str = Depends(get_request_id),
+) -> MeResponse:
+    # 读取上限 +1 字节即可判定超限，避免把任意大小文件读进内存。
+    data = await file.read(settings.AVATAR_MAX_SIZE_BYTES + 1)
+    return await service.update_avatar(
+        db,
+        user=user,
+        data=data,
+        content_type=file.content_type or "",
+        request_id=request_id,
+    )
+
+
 @router.get("/me/sessions", response_model=CursorPage[SessionItem])
 async def list_sessions(
     limit: int | None = Query(default=None, ge=1, le=100),
@@ -244,3 +273,106 @@ async def revoke_session(
         db, user_id=user.id, session_id=parsed, request_id=request_id
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/me/password", response_model=ActionMessage)
+async def change_password(
+    payload: PasswordChangeRequest,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(current_session),
+    db: AsyncSession = Depends(get_db),
+    request_id: str = Depends(get_request_id),
+    # 复用登录限流：改密接口可枚举旧密码，按同一把「登录」闸刀防爆破。
+    _rl: None = Depends(rate_limit("login")),
+) -> ActionMessage:
+    return await service.change_password(
+        db,
+        user=user,
+        current_session_id=session.id,
+        current_password=payload.current_password,
+        new_password=payload.new_password,
+        request_id=request_id,
+    )
+
+
+@router.post("/me/email", response_model=ActionMessage)
+async def request_email_change(
+    payload: EmailChangeRequestDTO,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(current_session),
+    db: AsyncSession = Depends(get_db),
+    request_id: str = Depends(get_request_id),
+    _rl: None = Depends(rate_limit("login")),
+) -> ActionMessage:
+    """发起邮箱换绑：校验当前密码后向新邮箱发送确认令牌（§21 双确认）。"""
+    result = await service.request_email_change(
+        db,
+        user=user,
+        session=session,
+        new_email=str(payload.new_email),
+        password=payload.password,
+        request_id=request_id,
+    )
+    return ActionMessage(message=result.message, mail_sent=settings.MAIL_ENABLED)
+
+
+@router.post("/me/email/confirm", response_model=ActionMessage)
+async def confirm_email_change(
+    payload: EmailChangeConfirmRequest,
+    db: AsyncSession = Depends(get_db),
+    request_id: str = Depends(get_request_id),
+) -> ActionMessage:
+    """确认邮箱换绑：令牌一次性、有时效；成功后撤销全部会话（§21）。"""
+    result = await service.confirm_email_change(
+        db, raw_token=payload.token, request_id=request_id
+    )
+    return ActionMessage(message=result.message)
+
+
+@router.post("/me/sessions/revoke-others", response_model=ActionMessage)
+async def revoke_other_sessions(
+    user: User = Depends(get_current_user),
+    session: Session = Depends(current_session),
+    db: AsyncSession = Depends(get_db),
+    request_id: str = Depends(get_request_id),
+) -> ActionMessage:
+    revoked = await service.revoke_other_sessions(
+        db, user_id=user.id, current_session_id=session.id, request_id=request_id
+    )
+    return ActionMessage(
+        message="已退出其他设备上的会话" if revoked else "当前没有其他活跃会话"
+    )
+
+
+@router.post("/me/deletion", response_model=ActionMessage)
+async def delete_account(
+    payload: DeletionRequest,
+    response: Response,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    request_id: str = Depends(get_request_id),
+) -> ActionMessage:
+    """注销账号：匿名化资料并撤销全部会话，业务事实保留（§9）。"""
+    result = await service.delete_account(
+        db,
+        user=user,
+        password=payload.password,
+        confirm=payload.confirm,
+        request_id=request_id,
+    )
+    _clear_session_cookie(response)
+    return result
+
+
+@router.get("/me/export")
+async def export_my_data(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """导出本人数据为 JSON 附件（§9）：不含文件字节、签名 URL 与他人数据。"""
+    payload = await service.export_my_data(db, user=user)
+    filename = f"njupt-kb-export-{date.today().isoformat()}.json"
+    return JSONResponse(
+        content=payload,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

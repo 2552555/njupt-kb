@@ -11,6 +11,7 @@ from datetime import datetime
 from enum import StrEnum
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -20,6 +21,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    false,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -35,6 +37,7 @@ __all__ = [
     "Correction",
     "ResourceRequest",
     "ResourceRequestFollow",
+    "ResourceRequestResponse",
 ]
 
 
@@ -122,6 +125,9 @@ class Comment(Base, UUIDPrimaryKey, Timestamped):
         ForeignKey("comments.id", ondelete="CASCADE"), nullable=True, index=True
     )
     body: Mapped[str] = mapped_column(Text, nullable=False)
+    withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_hidden: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
 
 
 class Correction(Base, UUIDPrimaryKey, Timestamped):
@@ -148,6 +154,8 @@ class Correction(Base, UUIDPrimaryKey, Timestamped):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default=CorrectionStatus.OPEN.value
     )
+    suggested_course_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("courses.id"), nullable=True)
+    suggested_resource_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
     resolution_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 新版本修复后关联工单，用于通知提交者（§20.2）。
     fixed_version_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -183,6 +191,17 @@ class ResourceRequest(Base, UUIDPrimaryKey, Timestamped):
         ForeignKey("resources.id", ondelete="SET NULL"), nullable=True
     )
     dedupe_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    handled_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+
+class ResourceRequestResponse(Base, UUIDPrimaryKey, Timestamped):
+    __tablename__ = "resource_request_responses"
+    __table_args__ = (UniqueConstraint("request_id", "resource_id", name="uq_request_response_resource"),)
+    request_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("resource_requests.id"), index=True)
+    resource_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("resources.id"))
+    submitted_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
 
 
 class ResourceRequestFollow(Base, UUIDPrimaryKey, Timestamped):

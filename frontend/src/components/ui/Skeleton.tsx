@@ -8,7 +8,7 @@ export function Skeleton({ className = '' }: SkeletonProps) {
   return (
     <div
       aria-hidden="true"
-      className={`animate-pulse bg-divider ${className}`}
+      className={`dn-skeleton ${className}`}
     />
   );
 }

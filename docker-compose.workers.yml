@@ -1,0 +1,26 @@
+# 可选队列隔离：docker compose -f docker-compose.prod.yml -f docker-compose.workers.yml up -d
+# 迁移时先暂停派发并清空旧 njupt 队列；保留 control worker 消费旧任务。
+services:
+  worker:
+    command: celery -A app.workers.celery_app:celery_app worker -Q njupt -l info --concurrency=1
+  worker-scan:
+    extends:
+      file: docker-compose.prod.yml
+      service: worker
+    command: celery -A app.workers.celery_app:celery_app worker -Q njupt.scan -l info --concurrency=2
+  worker-derive:
+    extends:
+      file: docker-compose.prod.yml
+      service: worker
+    command: celery -A app.workers.celery_app:celery_app worker -Q njupt.derive -l info --concurrency=1
+  worker-notify:
+    extends:
+      file: docker-compose.prod.yml
+      service: worker
+    command: celery -A app.workers.celery_app:celery_app worker -Q njupt.notify -l info --concurrency=2
+  worker-ai:
+    profiles: [ai]
+    extends:
+      file: docker-compose.prod.yml
+      service: worker
+    command: celery -A app.workers.celery_app:celery_app worker -Q njupt.ai -l info --concurrency=1

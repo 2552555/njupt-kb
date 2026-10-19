@@ -65,14 +65,14 @@ export function RegisterForm() {
         <p className="dn-kicker text-text-secondary">CREATE ACCOUNT</p>
         <h1 className="dn-display mt-1 text-3xl">注册</h1>
         <p className="mt-2 text-sm text-text-secondary">
-          使用邮箱注册。注册后需要完成邮箱验证才能使用上传等操作。
+          注册后需完成邮箱验证才能上传资料。
         </p>
       </header>
 
       {error && (
         <Notice tone="error" title="注册未完成">
           {error.message}
-          <p className="mt-1">请检查填写内容；邮箱已注册时可以直接登录。</p>
+          <p className="mt-1">请检查填写内容。</p>
         </Notice>
       )}
 

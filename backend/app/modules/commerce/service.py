@@ -11,6 +11,18 @@
 - 待结算 / 冻结 / 可提现 / 已提现分开，余额从账本核验，不使用 `users.balance`。
 - 分成比例、贡献公式、退款追溯与最低提现额均待确认（D16）：做成配置项，默认未配置，
   未配置时结算/提现接口抛 `NotEnabled`，不采用任何示例比例。
+
+beta15 增量（《用户权责、内容治理与授权收益体系设计文档》§10、§11、§14.4、§15.4、§15.5、§16.5）：
+
+事务与锁顺序（§16.5，全模块统一）：
+    用户交易锁 → 订单 → receipt/claim/refund → grant 与会员段 → allocation（按 ID 排序）
+    → 结算单/payout → ledger_accounts（按 ID 排序）。
+仅操作后段对象的流程不得取得后段锁后再回头取前段锁；需要关联前段时从完整顺序开始。
+本文件内 `allocate_order_item` / `accrue_revenue` / `reverse_revenue_for_refund` / `reserve_allocation`
+均只做 flush，不 commit；提交与回滚由调用方（`get_db` 请求事务）负责。
+
+金额口径：新增列一律整数分（`*_fen`）；既有 `Numeric(18,4)` 的元金额通过 `_fen()` 换算。
+`ledger_journals.event_key` 全局唯一，保证一次事件不重复计提／冲回（§14.4 不变量 3）。
 """
 
 from __future__ import annotations
@@ -19,7 +31,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import and_, func, or_, select
@@ -34,7 +46,9 @@ from app.core.enums import (
     DomainEventType,
     EntitlementSource,
     LedgerAccount,
+    LedgerBucket,
     LedgerDirection,
+    LedgerEventType,
     OrderStatus,
     PaymentAttemptStatus,
     PublicationStatus,
@@ -53,17 +67,28 @@ from app.core.pagination import (
 )
 from app.modules.commerce import channels
 from app.modules.commerce.models import (
+    AllocationReservation,
+    LedgerAccountRecord,
     LedgerEntry,
+    LedgerJournal,
+    LedgerLine,
     Order,
     OrderItem,
+    OrderItemAllocation,
+    OrderItemComponentAllocation,
     PaymentAttempt,
     Price,
     Product,
     Refund,
+    RefundBeneficiaryReversal,
+    RefundComponentAllocation,
+    RefundItem,
     Settlement,
     Withdrawal,
 )
 from app.modules.commerce.schemas import (
+    BeneficiaryAllocationOut,
+    ComponentAllocationOut,
     LedgerEntryOut,
     OrderCreate,
     OrderItemOut,
@@ -96,6 +121,17 @@ CREATOR_POOL_RATIO_ENV = "COMMERCE_CREATOR_POOL_RATIO"
 MIN_WITHDRAWAL_ENV = "COMMERCE_MIN_WITHDRAWAL"
 
 MONEY_QUANT = Decimal("0.0001")
+
+# --- beta15 明细级收益分配与收益子账（§10、§11、§15.4、§15.5）---
+BPS_DENOMINATOR = 10000
+# 退款能力版本：旧订单默认 FULL_ORDER_ONLY，新订单快照记录版本（§11.3、§18.2）。
+REFUND_CAPABILITY_FULL_ORDER = "FULL_ORDER_ONLY"
+REFUND_CAPABILITY_ORDER_ITEMS = "ORDER_ITEMS_V1"
+REFUND_SCOPE_FULL_ORDER = "FULL_ORDER"
+REFUND_SCOPE_ORDER_ITEMS = "ORDER_ITEMS"
+# 预留状态：无对应核心枚举，取值在服务层维护（见 models.AllocationReservation.state）。
+RESERVATION_ACTIVE = "active"
+RESERVATION_RELEASED = "released"
 
 
 # --------------------------------------------------------------------------
@@ -144,6 +180,114 @@ def min_withdrawal_amount(currency: str) -> Decimal | None:
     """最低提现额（D16 待确认）。未配置返回 None，提现接口据此抛 NotEnabled。"""
     del currency  # 首期单币种配置；多币种最低额待确认
     return _env_decimal(MIN_WITHDRAWAL_ENV)
+
+
+# --------------------------------------------------------------------------
+# beta15 金额与分配工具（§10.2：守恒、最大余数法、确定性顺序）
+# --------------------------------------------------------------------------
+def _fen(amount: Decimal | int | str) -> int:
+    """元金额（`Numeric(18,4)`）换算为整数分；四舍五入到分。"""
+    value = Decimal(str(amount))
+    return int((value * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _largest_remainder(total: int, weights: list[tuple[str, int]]) -> dict[str, int]:
+    """按权重把整数 `total` 拆成整数份（最大余数法，§10.2）。
+
+    先向下取整，再把剩余分按「余数降序、key 升序」依次 +1；同余数按不可变 key 顺序，
+    保证重跑顺序与结果一致。权重之和为 0 且 total 非 0 时抛输入错误。
+    """
+    result: dict[str, int] = {key: 0 for key, _ in weights}
+    positive = [(key, weight) for key, weight in weights if weight > 0]
+    weight_sum = sum(weight for _, weight in positive)
+    if weight_sum <= 0:
+        if total != 0:
+            raise InvalidInput("组件权重之和必须为正", details={"total": total})
+        return result
+    remainders: list[tuple[int, str]] = []
+    for key, weight in positive:
+        share, remainder = divmod(total * weight, weight_sum)
+        result[key] = share
+        remainders.append((remainder, key))
+    leftover = total - sum(result.values())
+    remainders.sort(key=lambda item: (-item[0], item[1]))
+    for index in range(leftover):
+        result[remainders[index % len(remainders)][1]] += 1
+    return result
+
+
+@dataclass(frozen=True)
+class BeneficiaryShare:
+    """组件内某一受益人的已确认份额（基点，合计应为 10000）。"""
+
+    beneficiary_party_id: uuid.UUID
+    share_bps: int
+
+
+@dataclass(frozen=True)
+class ComponentSpec:
+    """订单明细中一个组件的冻结分配输入（§10.2）。
+
+    `weight` 为该组件在明细内的相对权重（组合商品按权重拆分明细实收）；
+    `creator_bps` 为贡献者分成基点；`deduction_fen` 为经合同允许的分成前扣减。
+    """
+
+    component_key: str
+    weight: int
+    creator_bps: int
+    deduction_fen: int = 0
+    beneficiaries: tuple[BeneficiaryShare, ...] = ()
+    agreement_version_id: uuid.UUID | None = None
+    asset_version_id: uuid.UUID | None = None
+
+
+def _component_specs_from_snapshot(snapshot: dict[str, Any] | None) -> list[ComponentSpec]:
+    """把冻结的组成快照（JSON）解析为组件分配输入；无组成时返回空列表（旧订单）。"""
+    if not snapshot:
+        return []
+    specs: list[ComponentSpec] = []
+    for raw in snapshot.get("components", []):
+        shares = tuple(
+            BeneficiaryShare(
+                beneficiary_party_id=uuid.UUID(str(item["party_id"])),
+                share_bps=int(item.get("share_bps", 0)),
+            )
+            for item in raw.get("beneficiaries", [])
+        )
+        agreement_version_id = raw.get("agreement_version_id")
+        asset_version_id = raw.get("asset_version_id")
+        specs.append(
+            ComponentSpec(
+                component_key=str(raw["component_key"]),
+                weight=int(raw.get("weight", 0)),
+                creator_bps=int(raw.get("creator_bps", 0)),
+                deduction_fen=int(raw.get("deduction_fen", 0)),
+                beneficiaries=shares,
+                agreement_version_id=uuid.UUID(str(agreement_version_id))
+                if agreement_version_id
+                else None,
+                asset_version_id=uuid.UUID(str(asset_version_id)) if asset_version_id else None,
+            )
+        )
+    return specs
+
+
+def _order_items_refund_supported() -> bool:
+    """明细退款能力是否可用（§16.3、§18.3）。
+
+    按来源撤权、组件级访问控制、追偿与渠道多次退款尚未实现，因此即便商业开关与合规门槛
+    打开也返回 False，不静默降级为整单退款。
+    """
+    return False
+
+
+def _refund_capability_version() -> str:
+    """下单时冻结的退款能力版本（§11.3、§18.2）：明细退款未启用时为 FULL_ORDER_ONLY。"""
+    return (
+        REFUND_CAPABILITY_ORDER_ITEMS
+        if _order_items_refund_supported()
+        else REFUND_CAPABILITY_FULL_ORDER
+    )
 
 
 # --------------------------------------------------------------------------
@@ -396,6 +540,7 @@ async def create_order(
         total_amount=total,
         idempotency_key=key,
         expires_at=_now() + timedelta(minutes=DEFAULT_ORDER_TTL_MINUTES),
+        refund_capability_version=_refund_capability_version(),
     )
     db.add(order)
     await db.flush()
@@ -417,6 +562,16 @@ async def create_order(
                 grant_scope_id=product.grant_scope_id,
                 grant_capability=product.grant_capability,
                 grant_duration_days=product.grant_duration_days,
+                # 下单时冻结的销售主体、价格快照与退款能力版本（§15.4）；
+                # 比例等收益规则由服务端在确认到账时按冻结数据生成，不由前端传入。
+                seller_party_id=product.owner_id,
+                price_snapshot={
+                    "price_id": str(price.id),
+                    "version": price.version,
+                    "amount": str(price.amount),
+                    "currency": currency,
+                },
+                refund_capability_version=_refund_capability_version(),
             )
         )
     await db.flush()
@@ -622,6 +777,8 @@ async def confirm_payment(
     existing.status = PaymentAttemptStatus.SUCCEEDED.value
     existing.confirmed_at = _now()
     granted = await _grant_order_entitlements(db, order)
+    # beta15（§9.2）：按冻结组成生成明细级分配与初始计提，与确认、授权同事务提交。
+    await _generate_order_allocations(db, order)
     if order.status != OrderStatus.PAID.value:
         order.status = OrderStatus.PAID.value
         order.paid_at = _now()
@@ -754,6 +911,26 @@ async def _grant_order_entitlements(db: AsyncSession, order: Order) -> int:
     return created
 
 
+async def _generate_order_allocations(db: AsyncSession, order: Order) -> int:
+    """按订单行的冻结组成生成明细级分配与初始计提（§9.2）。
+
+    无 `composition_snapshot` 的行（旧订单）不生成分配，保持原语义（§18.2）。
+    返回生成的组件分配数。
+    """
+    items = list(
+        (await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))).scalars().all()
+    )
+    allocated = 0
+    for item in items:
+        specs = _component_specs_from_snapshot(item.composition_snapshot)
+        if not specs:
+            continue
+        allocated += len(await allocate_order_item(db, item, specs))
+    if allocated:
+        await accrue_revenue(db, order)
+    return allocated
+
+
 # --------------------------------------------------------------------------
 # 退款（§24.3）
 # --------------------------------------------------------------------------
@@ -767,12 +944,24 @@ async def create_refund(
 ) -> RefundOut:
     """发起退款：未确认前记录处理中；渠道未配置时整单失败，不假成功。"""
     _require_enabled()
+    if payload.scope == REFUND_SCOPE_ORDER_ITEMS:
+        # 明细退款能力未启用：显式拒绝，绝不静默退整单（§16.3、§18.3）。
+        raise Conflict(
+            "明细退款能力未启用",
+            code="REFUND_SCOPE_UNSUPPORTED",
+            details={
+                "scope": REFUND_SCOPE_ORDER_ITEMS,
+                "reason": "order_items_refund_not_enabled",
+                "gate_closed": settings.COMMERCE_COMPLIANCE_GATE_CLOSED,
+            },
+        )
     key = idem.normalize_key(idempotency_key)
     scope = f"{REFUND_SCOPE}:{user.id}"
     req_payload = {
         "order_id": str(payload.order_id),
         "amount": str(payload.amount) if payload.amount is not None else None,
         "reason": payload.reason,
+        "scope": payload.scope,
     }
     cached = await idem.lookup(db, scope=scope, key=key, payload=req_payload, actor_id=user.id)
     if cached is not None:
@@ -945,11 +1134,15 @@ async def confirm_refund(
     succeeded_total = await _refund_total(
         db, order.id, statuses=(RefundStatus.SUCCEEDED.value,)
     )
+    is_full_refund = succeeded_total >= Decimal(str(order.total_amount))
     order.status = (
-        OrderStatus.REFUNDED.value
-        if succeeded_total >= Decimal(str(order.total_amount))
-        else OrderStatus.REFUNDING.value
+        OrderStatus.REFUNDED.value if is_full_refund else OrderStatus.REFUNDING.value
     )
+    # 累计成功退款（分）与明细级收益冲回（§11.6、§14.4 不变量 4）。
+    order.refunded_fen = (order.refunded_fen or 0) + _fen(refund.amount)
+    if is_full_refund:
+        # 首期兼容策略：整单退全额时按明细分项冲回各受益人收益（§11.2、§18.2）。
+        await reverse_order_revenue(db, refund)
     await db.flush()
 
     await emit_event(
@@ -1360,6 +1553,751 @@ async def run_settlement(
         created=created_any,
         settlements=[SettlementOut.model_validate(item) for item in settlements],
     )
+
+
+# --------------------------------------------------------------------------
+# beta15 收益子账（§12.1、§14.3、§15.5）
+# --------------------------------------------------------------------------
+async def _ensure_account(
+    db: AsyncSession, party_id: uuid.UUID | None, currency: str, bucket: str
+) -> LedgerAccountRecord:
+    """取得（或创建）主体＋币种＋分桶账户；平台主体为 NULL。"""
+    stmt = select(LedgerAccountRecord).where(
+        LedgerAccountRecord.currency == currency, LedgerAccountRecord.bucket == bucket
+    )
+    if party_id is None:
+        stmt = stmt.where(LedgerAccountRecord.party_id.is_(None))
+    else:
+        stmt = stmt.where(LedgerAccountRecord.party_id == party_id)
+    account = (await db.execute(stmt)).scalars().first()
+    if account is None:
+        account = LedgerAccountRecord(party_id=party_id, currency=currency, bucket=bucket)
+        db.add(account)
+        await db.flush()
+    return account
+
+
+async def _write_journal_lines(
+    db: AsyncSession,
+    journal: LedgerJournal,
+    lines: list[tuple[LedgerAccountRecord, int, int, uuid.UUID | None]],
+) -> None:
+    """写入一组分录行；借方合计必须等于贷方合计（§15.5）。"""
+    debits = sum(debit for _, debit, _, _ in lines)
+    credits = sum(credit for _, _, credit, _ in lines)
+    if debits != credits:
+        raise Conflict(
+            "账本分录不平衡",
+            code="LEDGER_UNBALANCED",
+            details={"debit_fen": debits, "credit_fen": credits},
+        )
+    for account, debit, credit, allocation_id in lines:
+        if debit == 0 and credit == 0:
+            continue
+        db.add(
+            LedgerLine(
+                journal_id=journal.id,
+                account_id=account.id,
+                allocation_id=allocation_id,
+                debit_fen=debit,
+                credit_fen=credit,
+            )
+        )
+    await db.flush()
+
+
+async def _bucket_balance(
+    db: AsyncSession, party_id: uuid.UUID | None, currency: str, bucket: str
+) -> int:
+    """分桶余额 = 贷方合计 − 借方合计（整数分）。"""
+    stmt = select(LedgerAccountRecord).where(
+        LedgerAccountRecord.currency == currency, LedgerAccountRecord.bucket == bucket
+    )
+    if party_id is None:
+        stmt = stmt.where(LedgerAccountRecord.party_id.is_(None))
+    else:
+        stmt = stmt.where(LedgerAccountRecord.party_id == party_id)
+    account = (await db.execute(stmt)).scalars().first()
+    if account is None:
+        return 0
+    credits = await db.scalar(
+        select(func.coalesce(func.sum(LedgerLine.credit_fen), 0)).where(
+            LedgerLine.account_id == account.id
+        )
+    )
+    debits = await db.scalar(
+        select(func.coalesce(func.sum(LedgerLine.debit_fen), 0)).where(
+            LedgerLine.account_id == account.id
+        )
+    )
+    return int(credits or 0) - int(debits or 0)
+
+
+# --------------------------------------------------------------------------
+# beta15 明细级收益分配（§10、§14.4、§19 T15）
+# --------------------------------------------------------------------------
+async def allocate_order_item(
+    db: AsyncSession, order_item: OrderItem, components: list[ComponentSpec]
+) -> list[OrderItemComponentAllocation]:
+    """按组件与受益人写 `order_item_component_allocations` + `order_item_allocations`（§10.1）。
+
+    金额守恒：明细实收 = 组件分配合计；组件 `base − deduction = creator_total + platform`；
+    各受益人 `creator_fen` 合计 = 组件 `creator_total_fen`。
+    分尾差用最大余数法分配（§10.2），重跑顺序与结果一致：同一明细已分配时原样返回。
+    """
+    _require_enabled()
+    existing = list(
+        (
+            await db.execute(
+                select(OrderItemComponentAllocation)
+                .where(OrderItemComponentAllocation.order_item_id == order_item.id)
+                .order_by(OrderItemComponentAllocation.component_key)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if existing:
+        return existing
+
+    specs = list(components)
+    if not specs:
+        raise InvalidInput("订单明细缺少组件分配", details={"order_item_id": str(order_item.id)})
+    keys = [spec.component_key for spec in specs]
+    if len(set(keys)) != len(keys):
+        raise InvalidInput("组件 key 重复", details={"component_keys": keys})
+
+    item_fen = _fen(order_item.amount)
+    for spec in specs:
+        if spec.weight < 0 or spec.deduction_fen < 0:
+            raise InvalidInput("组件权重或扣减不能为负", details={"component_key": spec.component_key})
+        if not 0 <= spec.creator_bps <= BPS_DENOMINATOR:
+            raise InvalidInput("贡献者分成基点必须在 0—10000", details={"component_key": spec.component_key})
+
+    allocated = _largest_remainder(item_fen, [(spec.component_key, spec.weight) for spec in specs])
+
+    created: list[OrderItemComponentAllocation] = []
+    for spec in sorted(specs, key=lambda s: s.component_key):
+        component_fen = allocated[spec.component_key]
+        base_fen = component_fen - spec.deduction_fen
+        if base_fen < 0:
+            raise Conflict(
+                "组件扣减超过分配金额", code="DEDUCTION_EXCEEDS_ALLOCATION",
+                details={"component_key": spec.component_key},
+            )
+        creator_total = base_fen * spec.creator_bps // BPS_DENOMINATOR
+        platform_fen = base_fen - creator_total
+        component = OrderItemComponentAllocation(
+            order_item_id=order_item.id,
+            component_key=spec.component_key,
+            allocated_fen=component_fen,
+            base_fen=base_fen,
+            deduction_fen=spec.deduction_fen,
+            creator_total_fen=creator_total,
+            platform_fen=platform_fen,
+            rule_snapshot={
+                "weight": spec.weight,
+                "creator_bps": spec.creator_bps,
+                "deduction_fen": spec.deduction_fen,
+                "rounding": "largest_remainder",
+            },
+        )
+        db.add(component)
+        await db.flush()
+
+        shares = list(spec.beneficiaries)
+        if creator_total > 0 and not shares:
+            raise Conflict(
+                "组件有贡献者收益但未指定受益人", code="BENEFICIARY_REQUIRED",
+                details={"component_key": spec.component_key},
+            )
+        if shares and sum(share.share_bps for share in shares) != BPS_DENOMINATOR:
+            raise InvalidInput("受益人份额合计必须为 10000", details={"component_key": spec.component_key})
+        split = (
+            _largest_remainder(
+                creator_total,
+                [(str(share.beneficiary_party_id), share.share_bps) for share in shares],
+            )
+            if shares
+            else {}
+        )
+        for share in sorted(shares, key=lambda s: str(s.beneficiary_party_id)):
+            db.add(
+                OrderItemAllocation(
+                    component_allocation_id=component.id,
+                    beneficiary_party_id=share.beneficiary_party_id,
+                    agreement_version_id=spec.agreement_version_id,
+                    creator_fen=split.get(str(share.beneficiary_party_id), 0),
+                    share_snapshot={"share_bps": share.share_bps},
+                )
+            )
+        await db.flush()
+        created.append(component)
+
+    if sum(component.allocated_fen for component in created) != item_fen:
+        raise Conflict("组件分配金额与明细金额不一致", code="ALLOCATION_NOT_CONSERVED")
+    return created
+
+
+async def list_order_item_allocations(
+    db: AsyncSession, order_item_id: uuid.UUID
+) -> list[ComponentAllocationOut]:
+    """管理员查询：某订单明细的组件分配与受益人拆分（只读，需 ledger.view）。"""
+    components = list(
+        (
+            await db.execute(
+                select(OrderItemComponentAllocation)
+                .where(OrderItemComponentAllocation.order_item_id == order_item_id)
+                .order_by(OrderItemComponentAllocation.component_key)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: list[ComponentAllocationOut] = []
+    for component in components:
+        allocations = list(
+            (
+                await db.execute(
+                    select(OrderItemAllocation)
+                    .where(OrderItemAllocation.component_allocation_id == component.id)
+                    .order_by(OrderItemAllocation.beneficiary_party_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        dto = ComponentAllocationOut.model_validate(component)
+        out.append(
+            dto.model_copy(
+                update={
+                    "allocations": [
+                        BeneficiaryAllocationOut.model_validate(item) for item in allocations
+                    ]
+                }
+            )
+        )
+    return out
+
+
+async def accrue_revenue(
+    db: AsyncSession, order: Order, *, occurred_at: datetime | None = None
+) -> LedgerJournal | None:
+    """到账确认的初始计提（§12.1、§14.4 不变量 3）。
+
+    写一个 journal 与一组借贷相等的 lines，并确保 `ledger_accounts` 分桶存在：
+    借方平台账户（订单实收）；贷方各贡献者待成熟账户、平台归属与约定扣减。
+    `event_key = order_accrual:{order.id}` 全局唯一，重复提交／超时重试只计提一次。
+    旧订单无冻结组成时不生成收益，返回 None（§18.2）。
+    """
+    _require_enabled()
+    event_key = f"order_accrual:{order.id}"
+    existing = (
+        await db.execute(select(LedgerJournal).where(LedgerJournal.event_key == event_key))
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    components = list(
+        (
+            await db.execute(
+                select(OrderItemComponentAllocation)
+                .join(OrderItem, OrderItem.id == OrderItemComponentAllocation.order_item_id)
+                .where(OrderItem.order_id == order.id)
+                .order_by(OrderItemComponentAllocation.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not components:
+        return None
+
+    creator_by_party: dict[uuid.UUID, int] = {}
+    for component in components:
+        allocations = list(
+            (
+                await db.execute(
+                    select(OrderItemAllocation).where(
+                        OrderItemAllocation.component_allocation_id == component.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for allocation in allocations:
+            creator_by_party[allocation.beneficiary_party_id] = (
+                creator_by_party.get(allocation.beneficiary_party_id, 0) + allocation.creator_fen
+            )
+
+    platform_total = sum(component.platform_fen for component in components)
+    deduction_total = sum(component.deduction_fen for component in components)
+    order_fen = _fen(order.total_amount)
+    credited = sum(creator_by_party.values()) + platform_total + deduction_total
+    if credited != order_fen:
+        raise Conflict(
+            "收益计提与订单金额不一致",
+            code="ACCRUAL_NOT_CONSERVED",
+            details={"order_fen": order_fen, "credited_fen": credited},
+        )
+
+    journal = LedgerJournal(
+        event_key=event_key,
+        event_type=LedgerEventType.ORDER_ACCRUAL.value,
+        source_id=order.id,
+        occurred_at=occurred_at or _now(),
+    )
+    db.add(journal)
+    await db.flush()
+
+    platform_account = await _ensure_account(
+        db, None, order.currency, LedgerBucket.AVAILABLE.value
+    )
+    lines: list[tuple[LedgerAccountRecord, int, int, uuid.UUID | None]] = [
+        (platform_account, order_fen, 0, None)
+    ]
+    for party_id in sorted(creator_by_party, key=str):
+        fen = creator_by_party[party_id]
+        if fen <= 0:
+            continue
+        account = await _ensure_account(db, party_id, order.currency, LedgerBucket.PENDING.value)
+        lines.append((account, 0, fen, None))
+    if platform_total > 0:
+        lines.append((platform_account, 0, platform_total, None))
+    if deduction_total > 0:
+        # 约定扣减暂计入平台账户，具体科目待财务确认（§10.2）。
+        lines.append((platform_account, 0, deduction_total, None))
+    await _write_journal_lines(db, journal, lines)
+    return journal
+
+
+# --------------------------------------------------------------------------
+# beta15 退款冲回（§11.4、§14.4 不变量 4、§19 T16/T17）
+# --------------------------------------------------------------------------
+async def reverse_revenue_for_refund(
+    db: AsyncSession, refund: Refund, items: list[RefundItem]
+) -> list[RefundComponentAllocation]:
+    """退款成功后的收益冲回（§11.4）：按累计值算差额，避免多次小额退款累积误差。
+
+    - 每组件本次基数冲回 `d_c`：由该明细累计退款 `Q` 与原分配推导（全退时 `Q = 明细实收`）。
+    - 每组件累计贡献者冲回 = `floor(C × R / B)`，`R = B` 时取 `C`（完全冲尽）。
+    - 平台冲回 = `d_c − 本次贡献者冲回`，只计一次；各受益人按剩余份额用最大余数法拆分。
+    - 同一 `(refund_item, component_allocation)` 已冲回时跳过，重试幂等。
+    同时写 `event_key = refund_reversal:{refund.id}` 的账本事件（待成熟 → 已冲回）。
+    """
+    _require_enabled()
+    created: list[RefundComponentAllocation] = []
+    creator_reversal_by_party: dict[uuid.UUID, int] = {}
+    platform_reversal_total = 0
+
+    for item in items:
+        order_item = (
+            await db.execute(select(OrderItem).where(OrderItem.id == item.order_item_id))
+        ).scalar_one_or_none()
+        if order_item is None:
+            raise NotFound("订单明细不存在")
+        components = list(
+            (
+                await db.execute(
+                    select(OrderItemComponentAllocation)
+                    .where(OrderItemComponentAllocation.order_item_id == order_item.id)
+                    .order_by(OrderItemComponentAllocation.component_key)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not components:
+            continue
+        item_fen = _fen(order_item.amount)
+        if item.succeeded_fen == 0:
+            item.succeeded_fen = item.amount_fen
+        # 会话 autoflush=False：先落盘本轮成功退款，累计退款查询才能看到本轮金额。
+        await db.flush()
+        cumulative_refund = int(
+            await db.scalar(
+                select(func.coalesce(func.sum(RefundItem.succeeded_fen), 0)).where(
+                    RefundItem.order_item_id == order_item.id
+                )
+            )
+            or 0
+        )
+        if item_fen > 0 and cumulative_refund > item_fen:
+            raise Conflict(
+                "累计退款超过明细实收",
+                code="REFUND_EXCEEDS_ITEM",
+                details={"order_item_id": str(order_item.id)},
+            )
+
+        for component in components:
+            already = (
+                await db.execute(
+                    select(RefundComponentAllocation).where(
+                        RefundComponentAllocation.refund_item_id == item.id,
+                        RefundComponentAllocation.component_allocation_id == component.id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if already is not None:
+                continue
+
+            previous_base = int(
+                await db.scalar(
+                    select(func.coalesce(func.sum(RefundComponentAllocation.base_reduction_fen), 0)).where(
+                        RefundComponentAllocation.component_allocation_id == component.id
+                    )
+                )
+                or 0
+            )
+            previous_creator = int(
+                await db.scalar(
+                    select(
+                        func.coalesce(func.sum(RefundComponentAllocation.creator_total_reversal_fen), 0)
+                    ).where(RefundComponentAllocation.component_allocation_id == component.id)
+                )
+                or 0
+            )
+            base_fen = component.base_fen
+            if component.allocated_fen <= 0:
+                continue
+            if item_fen > 0 and cumulative_refund < item_fen:
+                target_base = base_fen * cumulative_refund // item_fen
+            else:
+                target_base = base_fen
+            target_base = min(target_base, base_fen)
+            base_reduction = max(target_base - previous_base, 0)
+            creator_total = component.creator_total_fen
+            if target_base >= base_fen:
+                target_creator = creator_total
+            elif base_fen > 0:
+                target_creator = creator_total * target_base // base_fen
+            else:
+                target_creator = 0
+            creator_reversal = max(target_creator - previous_creator, 0)
+            if base_reduction == 0 and creator_reversal == 0:
+                continue
+            platform_reversal = max(base_reduction - creator_reversal, 0)
+
+            component_reversal = RefundComponentAllocation(
+                refund_item_id=item.id,
+                component_allocation_id=component.id,
+                base_reduction_fen=base_reduction,
+                creator_total_reversal_fen=creator_reversal,
+                platform_reversal_fen=platform_reversal,
+            )
+            db.add(component_reversal)
+            await db.flush()
+            platform_reversal_total += platform_reversal
+
+            allocations = list(
+                (
+                    await db.execute(
+                        select(OrderItemAllocation)
+                        .where(OrderItemAllocation.component_allocation_id == component.id)
+                        .order_by(OrderItemAllocation.beneficiary_party_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            previous_by_allocation: dict[uuid.UUID, int] = {}
+            if allocations:
+                rows = (
+                    await db.execute(
+                        select(
+                            RefundBeneficiaryReversal.allocation_id,
+                            func.coalesce(func.sum(RefundBeneficiaryReversal.creator_reversal_fen), 0),
+                        )
+                        .join(
+                            RefundComponentAllocation,
+                            RefundComponentAllocation.id
+                            == RefundBeneficiaryReversal.refund_component_allocation_id,
+                        )
+                        .where(RefundComponentAllocation.component_allocation_id == component.id)
+                        .group_by(RefundBeneficiaryReversal.allocation_id)
+                    )
+                ).all()
+                previous_by_allocation = {row[0]: int(row[1]) for row in rows}
+
+            if creator_reversal > 0 and allocations:
+                if target_base >= base_fen:
+                    # 全退：按剩余份额精确冲尽，无分尾差残留（§19 T17）。
+                    per_allocation = {
+                        str(allocation.id): max(
+                            allocation.creator_fen - previous_by_allocation.get(allocation.id, 0), 0
+                        )
+                        for allocation in allocations
+                    }
+                else:
+                    per_allocation = _largest_remainder(
+                        creator_reversal,
+                        [
+                            (
+                                str(allocation.id),
+                                max(
+                                    allocation.creator_fen
+                                    - previous_by_allocation.get(allocation.id, 0),
+                                    0,
+                                ),
+                            )
+                            for allocation in allocations
+                        ],
+                    )
+                for allocation in allocations:
+                    fen = per_allocation.get(str(allocation.id), 0)
+                    if fen <= 0:
+                        continue
+                    db.add(
+                        RefundBeneficiaryReversal(
+                            refund_component_allocation_id=component_reversal.id,
+                            allocation_id=allocation.id,
+                            creator_reversal_fen=fen,
+                        )
+                    )
+                    creator_reversal_by_party[allocation.beneficiary_party_id] = (
+                        creator_reversal_by_party.get(allocation.beneficiary_party_id, 0) + fen
+                    )
+            await db.flush()
+            created.append(component_reversal)
+
+    if created:
+        await _post_refund_reversal_journal(
+            db, refund, creator_reversal_by_party, platform_reversal_total
+        )
+    return created
+
+
+async def _post_refund_reversal_journal(
+    db: AsyncSession,
+    refund: Refund,
+    creator_reversal_by_party: dict[uuid.UUID, int],
+    platform_reversal_total: int,
+) -> LedgerJournal | None:
+    """退款冲回的分录：待成熟/可结算 → 已冲回；`event_key` 唯一保证只冲回一次。"""
+    event_key = f"refund_reversal:{refund.id}"
+    existing = (
+        await db.execute(select(LedgerJournal).where(LedgerJournal.event_key == event_key))
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    lines: list[tuple[LedgerAccountRecord, int, int, uuid.UUID | None]] = []
+    for party_id in sorted(creator_reversal_by_party, key=str):
+        fen = creator_reversal_by_party[party_id]
+        if fen <= 0:
+            continue
+        pending = await _ensure_account(db, party_id, refund.currency, LedgerBucket.PENDING.value)
+        reversed_account = await _ensure_account(
+            db, party_id, refund.currency, LedgerBucket.REVERSED.value
+        )
+        lines.append((pending, fen, 0, None))
+        lines.append((reversed_account, 0, fen, None))
+    if platform_reversal_total > 0:
+        platform_available = await _ensure_account(
+            db, None, refund.currency, LedgerBucket.AVAILABLE.value
+        )
+        platform_reversed = await _ensure_account(
+            db, None, refund.currency, LedgerBucket.REVERSED.value
+        )
+        lines.append((platform_available, platform_reversal_total, 0, None))
+        lines.append((platform_reversed, 0, platform_reversal_total, None))
+    if not lines:
+        return None
+    journal = LedgerJournal(
+        event_key=event_key,
+        event_type=LedgerEventType.REFUND_REVERSAL.value,
+        source_id=refund.id,
+        occurred_at=_now(),
+    )
+    db.add(journal)
+    await db.flush()
+    await _write_journal_lines(db, journal, lines)
+    return journal
+
+
+async def _ensure_refund_items(db: AsyncSession, refund: Refund) -> list[RefundItem]:
+    """为整单退款生成（或取回）明细退款记录（§11.3、§18.2）。"""
+    order_items = list(
+        (
+            await db.execute(
+                select(OrderItem)
+                .where(OrderItem.order_id == refund.order_id)
+                .order_by(OrderItem.created_at, OrderItem.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    items: list[RefundItem] = []
+    for order_item in order_items:
+        existing = (
+            await db.execute(
+                select(RefundItem).where(
+                    RefundItem.refund_id == refund.id, RefundItem.order_item_id == order_item.id
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            amount_fen = _fen(order_item.amount)
+            existing = RefundItem(
+                refund_id=refund.id,
+                order_item_id=order_item.id,
+                amount_fen=amount_fen,
+                requested_fen=amount_fen,
+                succeeded_fen=amount_fen,
+                entitlement_action="REVOKE_ITEM",
+            )
+            db.add(existing)
+            await db.flush()
+        items.append(existing)
+    return items
+
+
+async def reverse_order_revenue(db: AsyncSession, refund: Refund) -> list[RefundComponentAllocation]:
+    """整单退款的收益冲回入口：按明细生成退款明细后冲回（§11.2 首期兼容策略）。"""
+    items = await _ensure_refund_items(db, refund)
+    return await reverse_revenue_for_refund(db, refund, items)
+
+
+async def accrue_order_revenue(
+    db: AsyncSession, order_id: uuid.UUID
+) -> LedgerJournal | None:
+    """管理员入口：对某订单执行初始计提（开关关闭时抛 NotEnabled）。"""
+    _require_enabled()
+    order = await _get_order(db, order_id)
+    return await accrue_revenue(db, order)
+
+
+async def reverse_refund_revenue(
+    db: AsyncSession, refund_id: uuid.UUID
+) -> list[RefundComponentAllocation]:
+    """管理员入口：对某退款执行收益冲回（开关关闭时抛 NotEnabled）。"""
+    _require_enabled()
+    refund = await _get_refund(db, refund_id)
+    return await reverse_order_revenue(db, refund)
+
+
+# --------------------------------------------------------------------------
+# beta15 分配预留与可结算净额（§11.6、§14.4 不变量 5、§19 T22）
+# --------------------------------------------------------------------------
+async def reserve_allocation(
+    db: AsyncSession,
+    allocation_id: uuid.UUID,
+    source_type: str,
+    source_id: uuid.UUID,
+    amount_fen: int,
+) -> AllocationReservation:
+    """按来源预留某分配的风险金额（§11.6）：同来源不重复预留；锁分配后查余额。
+
+    先锁 allocation 行，再校验 `可结算净额 = creator_fen − 已冲回 − 已预留`；
+    同一来源重复预留时幂等返回既有记录。
+    """
+    _require_enabled()
+    if amount_fen <= 0:
+        raise InvalidInput("预留金额必须为正", details={"amount_fen": amount_fen})
+    allocation = (
+        await db.execute(
+            select(OrderItemAllocation)
+            .where(OrderItemAllocation.id == allocation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if allocation is None:
+        raise NotFound("收益分配不存在")
+
+    existing = (
+        await db.execute(
+            select(AllocationReservation).where(
+                AllocationReservation.allocation_id == allocation_id,
+                AllocationReservation.source_type == source_type,
+                AllocationReservation.source_id == source_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.state == RESERVATION_ACTIVE:
+            return existing
+        raise Conflict("该来源的预留已释放，不能重复预留", code="RESERVATION_RELEASED")
+
+    reversed_total = int(
+        await db.scalar(
+            select(func.coalesce(func.sum(RefundBeneficiaryReversal.creator_reversal_fen), 0)).where(
+                RefundBeneficiaryReversal.allocation_id == allocation_id
+            )
+        )
+        or 0
+    )
+    reserved_total = int(
+        await db.scalar(
+            select(func.coalesce(func.sum(AllocationReservation.amount_fen), 0)).where(
+                AllocationReservation.allocation_id == allocation_id,
+                AllocationReservation.state == RESERVATION_ACTIVE,
+            )
+        )
+        or 0
+    )
+    available = allocation.creator_fen - reversed_total - reserved_total
+    if amount_fen > available:
+        raise Conflict(
+            "可结算净额不足",
+            code="INSUFFICIENT_SETTLEABLE_AMOUNT",
+            details={"available_fen": available, "requested_fen": amount_fen},
+        )
+    reservation = AllocationReservation(
+        allocation_id=allocation_id,
+        source_type=source_type,
+        source_id=source_id,
+        amount_fen=amount_fen,
+        state=RESERVATION_ACTIVE,
+    )
+    db.add(reservation)
+    await db.flush()
+    return reservation
+
+
+async def release_reservation(db: AsyncSession, reservation_id: uuid.UUID) -> AllocationReservation:
+    """释放预留（退款被拒／案件解除）；重复释放幂等。"""
+    _require_enabled()
+    reservation = (
+        await db.execute(
+            select(AllocationReservation)
+            .where(AllocationReservation.id == reservation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if reservation is None:
+        raise NotFound("预留记录不存在")
+    if reservation.state == RESERVATION_ACTIVE:
+        reservation.state = RESERVATION_RELEASED
+        await db.flush()
+    return reservation
+
+
+async def settleable_balance(db: AsyncSession, party_id: uuid.UUID, currency: str) -> int:
+    """可结算净额 = 可支付 − 已有预留（§14.4 不变量 5）。
+
+    本版未配置成熟规则，待成熟（PENDING）与可结算（AVAILABLE）合并计为可支付；
+    减去 `allocation_reservations` 中该主体 allocation 的 active 预留。成熟规则确认后再分桶。
+    """
+    payable = await _bucket_balance(db, party_id, currency, LedgerBucket.PENDING.value)
+    payable += await _bucket_balance(db, party_id, currency, LedgerBucket.AVAILABLE.value)
+    reserved = int(
+        await db.scalar(
+            select(func.coalesce(func.sum(AllocationReservation.amount_fen), 0))
+            .join(
+                OrderItemAllocation,
+                OrderItemAllocation.id == AllocationReservation.allocation_id,
+            )
+            .where(
+                OrderItemAllocation.beneficiary_party_id == party_id,
+                AllocationReservation.state == RESERVATION_ACTIVE,
+            )
+        )
+        or 0
+    )
+    return payable - reserved
 
 
 # --------------------------------------------------------------------------

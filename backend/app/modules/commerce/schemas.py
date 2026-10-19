@@ -9,6 +9,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -97,6 +98,8 @@ class OrderOut(BaseModel):
     status: OrderStatus
     currency: str
     total_amount: Decimal
+    refunded_fen: int = 0
+    refund_capability_version: str | None = None
     expires_at: datetime | None = None
     paid_at: datetime | None = None
     cancelled_at: datetime | None = None
@@ -122,11 +125,22 @@ class PaymentAttemptOut(BaseModel):
 # --- 退款（§24.2、§24.3）---
 
 
+class RefundItemIn(_InputModel):
+    """明细退款请求项（§16.3、§16.4 虚构示例）。"""
+
+    order_item_id: uuid.UUID
+    amount_fen: int = Field(gt=0)
+    requested_action: str | None = Field(default=None, max_length=32)
+
+
 class RefundCreate(_InputModel):
     order_id: uuid.UUID
     # 为空表示整单全额退款。
     amount: Decimal | None = Field(default=None, gt=0)
     reason: str = Field(min_length=1, max_length=1000)
+    # 退款范围：FULL_ORDER 保持原语义；ORDER_ITEMS 明细退款仅在能力启用后开放（§16.3）。
+    scope: Literal["FULL_ORDER", "ORDER_ITEMS"] = "FULL_ORDER"
+    items: list[RefundItemIn] = Field(default_factory=list)
 
 
 class RefundConfirmIn(_InputModel):
@@ -237,3 +251,74 @@ class SettlementRunOut(BaseModel):
 
     created: bool
     settlements: list[SettlementOut]
+
+
+# --- beta15 明细级收益分配与收益子账（§10、§15.4、§15.5）---
+
+
+class BeneficiaryAllocationOut(BaseModel):
+    """组件金额在某受益人名下的拆分（只读）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    component_allocation_id: uuid.UUID
+    beneficiary_party_id: uuid.UUID
+    agreement_version_id: uuid.UUID | None = None
+    creator_fen: int
+
+
+class ComponentAllocationOut(BaseModel):
+    """订单明细的组件分配（只读）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    order_item_id: uuid.UUID
+    component_key: str
+    allocated_fen: int
+    base_fen: int
+    deduction_fen: int
+    creator_total_fen: int
+    platform_fen: int
+    allocations: list[BeneficiaryAllocationOut] = []
+
+
+class ReservationCreate(_InputModel):
+    """按来源预留某分配的风险金额（§11.6）。"""
+
+    source_type: str = Field(min_length=1, max_length=32)
+    source_id: uuid.UUID
+    amount_fen: int = Field(gt=0)
+
+
+class ReservationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    allocation_id: uuid.UUID
+    source_type: str
+    source_id: uuid.UUID
+    amount_fen: int
+    state: str
+
+
+class SettleableBalanceOut(BaseModel):
+    """可结算净额（整数分）：可支付 − active 预留。"""
+
+    party_id: uuid.UUID
+    currency: str
+    settleable_fen: int
+
+
+class AccrualResult(BaseModel):
+    """初始计提结果：created=False 表示已计提过（event_key 唯一），未重复入账。"""
+
+    created: bool
+    journal_id: uuid.UUID | None = None
+
+
+class ReversalResult(BaseModel):
+    """收益冲回结果：created 为本次新增的组件冲回记录数。"""
+
+    created: int

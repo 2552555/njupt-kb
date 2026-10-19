@@ -7,6 +7,7 @@
  * 返回结构化结果而不是抛异常：页面据此给出明确静态回退，
  * 不把接口故障显示成「暂无资料」（§39 A21）。
  */
+import 'server-only';
 import { cookies } from 'next/headers';
 
 const API_ORIGIN =

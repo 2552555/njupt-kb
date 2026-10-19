@@ -5,7 +5,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import { ReactNode, useEffect } from 'react';
 import { Lock, ShieldAlert } from 'lucide-react';
 
-import { canReview, useAuthStore } from '@/stores/authStore';
+import { canAccessAdmin, useAuthStore } from '@/stores/authStore';
 
 function StatusBlock({
   title,
@@ -50,7 +50,7 @@ export function AuthGuard({
 
   useEffect(() => {
     if (status === 'guest') {
-      router.replace(`/login?next=${encodeURIComponent(pathname)}`);
+      router.replace(`/login?next=${encodeURIComponent(pathname + window.location.search)}`);
     }
   }, [status, router, pathname]);
 
@@ -67,12 +67,12 @@ export function AuthGuard({
     );
   }
 
-  if (requireReview && !canReview(user)) {
+  if (requireReview && !canAccessAdmin(user)) {
     return (
       <StatusBlock
         icon={ShieldAlert}
-        title="需要审核权限"
-        description="该页面只对审核员与管理员开放。如果你的职责包含审核，请联系管理员调整账号角色。"
+        title="需要管理权限"
+        description="请使用持有所需管理权限的账号访问。"
       />
     );
   }

@@ -60,11 +60,21 @@ class ReviewOut(_ORMModel):
 
 
 class ReviewDecisionIn(BaseModel):
+    # 决定取值：approve / needs_info（补证）/ reject，见 ModerationDecisionType。
     decision: ModerationDecisionType
-    # 审核员必须给出明确结论和理由（§13.2）。
+    # 审核员必须给出明确结论和理由（§13.2）；补证与拒绝都须说明依据。
     reason: str = Field(min_length=1, max_length=2000)
     # 审核员所查看快照的标识；与当前快照不一致时返回冲突（§13.3）。
     snapshot_revision: int = Field(ge=1)
+
+
+class PublicationCandidateOut(BaseModel):
+    review_id: uuid.UUID
+    resource_id: uuid.UUID
+    version_id: uuid.UUID
+    title: str
+    expected_revision: int
+    reviewed_at: datetime | None
 
 
 class ModerationDecisionOut(_ORMModel):
@@ -144,6 +154,112 @@ class ReportEventOut(_ORMModel):
     note: str | None = None
     evidence: dict[str, Any] | None = None
     created_at: datetime
+
+
+class PersonalReportOut(BaseModel):
+    id: uuid.UUID
+    kind: Literal["resource", "comment"]
+    available: bool
+    resource_id: uuid.UUID | None = None
+    version_id: uuid.UUID | None = None
+    comment_id: uuid.UUID | None = None
+    title: str | None = None
+    reason_code: str
+    description: str | None = None
+    status: ReportStatus
+    created_at: datetime
+    updated_at: datetime
+
+
+class PersonalReportEventOut(_ORMModel):
+    """本人进度只公开状态与时间，内部证据、处理人和备注仍留在治理端。"""
+
+    id: uuid.UUID
+    from_status: ReportStatus | None = None
+    to_status: ReportStatus
+    created_at: datetime
+
+
+class PersonalCommentAppealOut(BaseModel):
+    id: uuid.UUID
+    available: bool
+    resource_id: uuid.UUID | None = None
+    comment_id: uuid.UUID | None = None
+    title: str | None = None
+    reason: str
+    status: Literal["pending", "accepted", "rejected"]
+    handled_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# --- 评论举报与申诉（§18、§20.2）---
+
+
+class CommentReportCreateIn(BaseModel):
+    """资料讨论区举报：理由必填 1–500 字，自举报由服务层拒绝。"""
+
+    resource_id: uuid.UUID
+    comment_id: uuid.UUID
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class CommentReportOut(BaseModel):
+    """评论举报工单。附带评论摘要供管理员判断；评论正文不写入审计。"""
+
+    id: uuid.UUID
+    resource_id: uuid.UUID
+    comment_id: uuid.UUID
+    reporter_id: uuid.UUID
+    reason: str
+    status: ReportStatus
+    revision: int
+    created_at: datetime
+    updated_at: datetime
+    comment_body: str | None = None
+    comment_status: Literal["visible", "withdrawn", "hidden"] | None = None
+    comment_revision: int | None = None
+    comment_author_id: uuid.UUID | None = None
+
+
+class CommentReportDecisionIn(BaseModel):
+    """受理 / 驳回 / 处置。处置（resolve）会复用评论隐藏能力，需给出评论当前修订号。"""
+
+    action: Literal["accept", "dismiss", "resolve"]
+    reason: str = Field(min_length=1, max_length=500)
+    expected_revision: int = Field(ge=1)
+    comment_revision: int | None = Field(default=None, ge=1)
+
+
+class CommentAppealCreateIn(BaseModel):
+    resource_id: uuid.UUID
+    comment_id: uuid.UUID
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class CommentAppealOut(BaseModel):
+    id: uuid.UUID
+    comment_id: uuid.UUID
+    resource_id: uuid.UUID
+    appellant_id: uuid.UUID
+    reason: str
+    status: Literal["pending", "accepted", "rejected"]
+    revision: int
+    handled_by: uuid.UUID | None = None
+    handled_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    comment_status: Literal["visible", "withdrawn", "hidden"] | None = None
+    comment_revision: int | None = None
+
+
+class CommentAppealDecisionIn(BaseModel):
+    """采纳（恢复评论）或驳回；采纳时需给出评论当前修订号。"""
+
+    decision: Literal["accept", "reject"]
+    reason: str = Field(min_length=1, max_length=500)
+    expected_revision: int = Field(ge=1)
+    comment_revision: int | None = Field(default=None, ge=1)
 
 
 # --- 审计 ---

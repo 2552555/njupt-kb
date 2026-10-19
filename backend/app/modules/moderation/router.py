@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,15 +25,26 @@ from app.core.permissions import (
     USER_SUSPEND,
     require,
 )
-from app.modules.moderation import service
+from app.modules.moderation import comment_reports, personal, service
+from app.modules.moderation.models import AppealStatus
 from app.modules.moderation.schemas import (
     AuditLogOut,
     CatalogCorrectionIn,
+    CommentAppealCreateIn,
+    CommentAppealDecisionIn,
+    CommentAppealOut,
+    CommentReportCreateIn,
+    CommentReportDecisionIn,
+    CommentReportOut,
     FreshnessIn,
     ModerationDecisionOut,
     ModerationSummaryOut,
     PublicationIn,
     PublicationOut,
+    PublicationCandidateOut,
+    PersonalReportOut,
+    PersonalReportEventOut,
+    PersonalCommentAppealOut,
     ReportCreateIn,
     ReportEventIn,
     ReportEventOut,
@@ -48,6 +59,55 @@ if TYPE_CHECKING:  # pragma: no cover
     from app.modules.identity.models import User
 
 router = APIRouter()
+
+
+@router.get("/me/reports", response_model=CursorPage[PersonalReportOut])
+async def list_personal_reports(
+    kind: Literal["resource", "comment"] | None = Query(default=None),
+    report_status: list[ReportStatus] | None = Query(default=None, alias="status"),
+    limit: int | None = Query(default=None, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+    user: "User" = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CursorPage[PersonalReportOut]:
+    return await personal.list_reports(
+        db, user=user, kind=kind, statuses=report_status, limit=limit, cursor=cursor,
+    )
+
+
+@router.get("/me/reports/{report_id}", response_model=PersonalReportOut)
+async def get_personal_report(
+    report_id: uuid.UUID,
+    user: "User" = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PersonalReportOut:
+    return await personal.get_report(db, user=user, report_id=report_id)
+
+
+@router.get("/me/reports/{report_id}/events", response_model=CursorPage[PersonalReportEventOut])
+async def list_personal_report_events(
+    report_id: uuid.UUID,
+    limit: int | None = Query(default=None, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+    user: "User" = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CursorPage[PersonalReportEventOut]:
+    return await personal.list_report_events(
+        db, user=user, report_id=report_id, limit=limit, cursor=cursor,
+    )
+
+
+@router.get("/me/comment-appeals", response_model=CursorPage[PersonalCommentAppealOut])
+async def list_personal_comment_appeals(
+    appeal_status: list[AppealStatus] | None = Query(default=None, alias="status"),
+    limit: int | None = Query(default=None, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+    user: "User" = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CursorPage[PersonalCommentAppealOut]:
+    return await personal.list_comment_appeals(
+        db, user=user, statuses=appeal_status, limit=limit, cursor=cursor,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -108,6 +168,7 @@ async def decide_review(
     request_id: str = Depends(get_request_id),
     db: AsyncSession = Depends(get_db),
 ) -> ModerationDecisionOut:
+    """给出审核决定：通过（approve）、补证（needs_info）或拒绝（reject），需 content.review。"""
     decision = await service.decide(
         db,
         review_id=review_id,
@@ -123,6 +184,14 @@ async def decide_review(
 # --------------------------------------------------------------------------- #
 # 发布与时效
 # --------------------------------------------------------------------------- #
+
+
+@router.get("/admin/publication-candidates", response_model=CursorPage[PublicationCandidateOut])
+async def publication_candidates(
+    limit: int | None = Query(default=None, ge=1, le=100), cursor: str | None = None,
+    user: "User" = Depends(require(RESOURCE_PUBLISH)), db: AsyncSession = Depends(get_db),
+) -> CursorPage[PublicationCandidateOut]:
+    return await service.list_publication_candidates(db, limit=limit, cursor=cursor)
 
 
 @router.post("/admin/resources/{resource_id}/publication", response_model=PublicationOut)
@@ -223,6 +292,119 @@ async def append_report_event(
         db, report_id=report_id, actor=user, payload=payload, request_id=request_id
     )
     return ReportEventOut.model_validate(event)
+
+
+# --------------------------------------------------------------------------- #
+# 评论举报与申诉（§18、§20.2）
+# --------------------------------------------------------------------------- #
+
+
+@router.post(
+    "/reports/comments", response_model=CommentReportOut, status_code=status.HTTP_201_CREATED
+)
+async def create_comment_report(
+    payload: CommentReportCreateIn,
+    user: "User" = Depends(get_current_user),
+    request_id: str = Depends(get_request_id),
+    db: AsyncSession = Depends(get_db),
+) -> CommentReportOut:
+    """资料讨论区举报：普通用户能力（登录 + active 账号即可，不需新权限）。"""
+    return await comment_reports.create_comment_report(
+        db,
+        reporter=user,
+        resource_id=payload.resource_id,
+        comment_id=payload.comment_id,
+        reason=payload.reason,
+        request_id=request_id,
+    )
+
+
+@router.get("/admin/comment-reports", response_model=CursorPage[CommentReportOut])
+async def list_comment_reports(
+    report_status: list[ReportStatus] | None = Query(default=None, alias="status"),
+    limit: int | None = Query(default=None, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+    user: "User" = Depends(require(REPORT_HANDLE)),
+    db: AsyncSession = Depends(get_db),
+) -> CursorPage[CommentReportOut]:
+    return await comment_reports.list_comment_reports(
+        db, statuses=report_status, limit=limit, cursor=cursor
+    )
+
+
+@router.post("/admin/comment-reports/{report_id}/decision", response_model=CommentReportOut)
+async def decide_comment_report(
+    report_id: uuid.UUID,
+    payload: CommentReportDecisionIn,
+    user: "User" = Depends(require(REPORT_HANDLE)),
+    request_id: str = Depends(get_request_id),
+    db: AsyncSession = Depends(get_db),
+) -> CommentReportOut:
+    """受理 / 驳回 / 处置（处置复用评论隐藏能力）。"""
+    return await comment_reports.decide_comment_report(
+        db,
+        report_id=report_id,
+        actor=user,
+        action=payload.action,
+        reason=payload.reason,
+        expected_revision=payload.expected_revision,
+        comment_revision=payload.comment_revision,
+        request_id=request_id,
+    )
+
+
+@router.post(
+    "/comment-appeals", response_model=CommentAppealOut, status_code=status.HTTP_201_CREATED
+)
+async def create_comment_appeal(
+    payload: CommentAppealCreateIn,
+    user: "User" = Depends(get_current_user),
+    request_id: str = Depends(get_request_id),
+    db: AsyncSession = Depends(get_db),
+) -> CommentAppealOut:
+    """被隐藏评论的作者提交一次申诉。"""
+    return await comment_reports.create_comment_appeal(
+        db,
+        appellant=user,
+        resource_id=payload.resource_id,
+        comment_id=payload.comment_id,
+        reason=payload.reason,
+        request_id=request_id,
+    )
+
+
+@router.get("/admin/comment-appeals", response_model=CursorPage[CommentAppealOut])
+async def list_comment_appeals(
+    appeal_status: list[AppealStatus] | None = Query(default=None, alias="status"),
+    limit: int | None = Query(default=None, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+    user: "User" = Depends(require(REPORT_HANDLE)),
+    db: AsyncSession = Depends(get_db),
+) -> CursorPage[CommentAppealOut]:
+    return await comment_reports.list_comment_appeals(
+        db, statuses=appeal_status, limit=limit, cursor=cursor
+    )
+
+
+@router.post("/admin/comment-appeals/{appeal_id}/decision", response_model=CommentAppealOut)
+async def decide_comment_appeal(
+    appeal_id: uuid.UUID,
+    payload: CommentAppealDecisionIn,
+    user: "User" = Depends(require(REPORT_HANDLE)),
+    request_id: str = Depends(get_request_id),
+    db: AsyncSession = Depends(get_db),
+) -> CommentAppealOut:
+    """采纳（恢复评论）或驳回申诉。"""
+    return await comment_reports.decide_comment_appeal(
+        db,
+        appeal_id=appeal_id,
+        actor=user,
+        decision=payload.decision,
+        reason=payload.reason,
+        expected_revision=payload.expected_revision,
+        comment_revision=payload.comment_revision,
+        request_id=request_id,
+    )
 
 
 # --------------------------------------------------------------------------- #

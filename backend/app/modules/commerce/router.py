@@ -16,9 +16,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user, get_db, get_request_id
 from app.core.pagination import CursorPage
-from app.core.permissions import FINANCE_VIEW, SETTLEMENT_MANAGE, require
+from app.core.permissions import (
+    FINANCE_VIEW,
+    LEDGER_VIEW,
+    SETTLEMENT_MANAGE,
+    require,
+)
 from app.modules.commerce import channels, service
 from app.modules.commerce.schemas import (
+    AccrualResult,
+    ComponentAllocationOut,
     OrderCreate,
     OrderOut,
     PaymentAttemptOut,
@@ -27,6 +34,10 @@ from app.modules.commerce.schemas import (
     RefundConfirmIn,
     RefundCreate,
     RefundOut,
+    ReversalResult,
+    ReservationCreate,
+    ReservationOut,
+    SettleableBalanceOut,
 )
 
 router = APIRouter(tags=["commerce"])
@@ -164,3 +175,75 @@ async def admin_reconciliations(
 ) -> CursorPage[ReconciliationItem]:
     """对账视图：本地支付尝试与渠道状态的差异（只读，需 finance.view）。"""
     return await service.list_reconciliations(db, limit=limit, cursor=cursor)
+
+
+# --------------------------------------------------------------------------
+# beta15：明细级收益分配、收益子账与预留（管理员入口，§10、§15.4、§15.5）
+# --------------------------------------------------------------------------
+@router.get("/admin/order-items/{order_item_id}/allocations", response_model=list[ComponentAllocationOut])
+async def admin_order_item_allocations(
+    order_item_id: uuid.UUID,
+    actor=Depends(require(LEDGER_VIEW)),
+    db: AsyncSession = Depends(get_db),
+) -> list[ComponentAllocationOut]:
+    """某订单明细的组件分配与受益人拆分（只读，需 ledger.view）。"""
+    return await service.list_order_item_allocations(db, order_item_id)
+
+
+@router.get("/admin/parties/{party_id}/settleable", response_model=SettleableBalanceOut)
+async def admin_settleable_balance(
+    party_id: uuid.UUID,
+    currency: str = Query(min_length=3, max_length=3),
+    actor=Depends(require(FINANCE_VIEW)),
+    db: AsyncSession = Depends(get_db),
+) -> SettleableBalanceOut:
+    """某主体的可结算净额（只读，需 finance.view）。"""
+    fen = await service.settleable_balance(db, party_id, currency)
+    return SettleableBalanceOut(party_id=party_id, currency=currency, settleable_fen=fen)
+
+
+@router.post("/admin/orders/{order_id}/accrual", response_model=AccrualResult)
+async def admin_accrue_order(
+    order_id: uuid.UUID,
+    actor=Depends(require(SETTLEMENT_MANAGE)),
+    db: AsyncSession = Depends(get_db),
+) -> AccrualResult:
+    """对某订单执行初始计提（需 settlement.manage）；开关关闭时抛 NotEnabled。"""
+    journal = await service.accrue_order_revenue(db, order_id)
+    return AccrualResult(created=journal is not None, journal_id=journal.id if journal else None)
+
+
+@router.post("/admin/allocations/{allocation_id}/reservations", response_model=ReservationOut)
+async def admin_reserve_allocation(
+    allocation_id: uuid.UUID,
+    body: ReservationCreate,
+    actor=Depends(require(SETTLEMENT_MANAGE)),
+    db: AsyncSession = Depends(get_db),
+) -> ReservationOut:
+    """按来源预留某分配的风险金额（需 settlement.manage）；开关关闭时抛 NotEnabled。"""
+    reservation = await service.reserve_allocation(
+        db, allocation_id, body.source_type, body.source_id, body.amount_fen
+    )
+    return ReservationOut.model_validate(reservation)
+
+
+@router.post("/admin/reservations/{reservation_id}/release", response_model=ReservationOut)
+async def admin_release_reservation(
+    reservation_id: uuid.UUID,
+    actor=Depends(require(SETTLEMENT_MANAGE)),
+    db: AsyncSession = Depends(get_db),
+) -> ReservationOut:
+    """释放预留（需 settlement.manage）；开关关闭时抛 NotEnabled。"""
+    reservation = await service.release_reservation(db, reservation_id)
+    return ReservationOut.model_validate(reservation)
+
+
+@router.post("/admin/refunds/{refund_id}/reverse-revenue", response_model=ReversalResult)
+async def admin_reverse_refund_revenue(
+    refund_id: uuid.UUID,
+    actor=Depends(require(SETTLEMENT_MANAGE)),
+    db: AsyncSession = Depends(get_db),
+) -> ReversalResult:
+    """对某退款执行收益冲回（需 settlement.manage）；开关关闭时抛 NotEnabled。"""
+    created = await service.reverse_refund_revenue(db, refund_id)
+    return ReversalResult(created=len(created))

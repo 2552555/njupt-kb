@@ -14,12 +14,12 @@ import hashlib
 import tempfile
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from app.config import settings
 from app.core.enums import ScanStatus
-from app.core.storage import storage
+from app.core.storage import ObjectSizeExceeded, storage
 
 # 首期允许稳定转换与解析的格式（§16.1、D06）。
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -128,13 +128,23 @@ def _sha256(path: Path) -> str:
 def _detect_ooxml(path: Path) -> str | None:
     try:
         with zipfile.ZipFile(path) as archive:
-            names = archive.namelist()
+            entries = archive.infolist()
+            if len(entries) > settings.MAX_ARCHIVE_ENTRIES:
+                raise ParseFailure("压缩条目数超过上限")
+            if sum(entry.file_size for entry in entries) > settings.MAX_ARCHIVE_UNPACKED_BYTES:
+                raise ParseFailure("解包大小超过上限")
+            for entry in entries:
+                name = entry.filename.replace("\\", "/")
+                parts = PurePosixPath(name)
+                if parts.is_absolute() or ".." in parts.parts or ":" in name or (entry.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise ParseFailure("压缩包包含不安全路径")
+            names = [entry.filename for entry in entries]
     except (zipfile.BadZipFile, OSError):
         return None
     if "[Content_Types].xml" not in names:
         return None
     # 宏文档不作为可发布内容类型（§16.1）。
-    if any(name.endswith("vbaProject.bin") for name in names):
+    if any(name.casefold().endswith("vbaproject.bin") for name in names):
         return None
     if any(name.startswith("word/") for name in names):
         return DOCX_MIME
@@ -165,13 +175,18 @@ def _pdf_page_count(path: Path) -> int:
     reader = PdfReader(str(path))
     if reader.is_encrypted:
         raise ParseFailure("PDF 已加密")
-    return len(reader.pages)
+    count = len(reader.pages)
+    if not 1 <= count <= settings.MAX_DOCUMENT_PAGES:
+        raise ParseFailure("PDF 页数超过限制或没有页面")
+    return count
 
 
 def _image_page_count(path: Path) -> int:
     from PIL import Image
 
     with Image.open(path) as image:
+        if image.width * image.height > settings.MAX_IMAGE_PIXELS:
+            raise ParseFailure("图片像素超过上限")
         image.verify()
     return 1
 
@@ -190,14 +205,17 @@ async def _parse_pages(path: Path, mime: str) -> int | None:
 
 
 async def scan_quarantined_object(
-    storage_key: str, *, original_name: str
+    storage_key: str, *, original_name: str, verified_storage_key: str
 ) -> ScanOutcome:
     """从隔离区取回对象，完成大小、格式、扩展名一致性与恶意内容检查（§16 步骤 5）。"""
     provider = get_scan_provider()
     with tempfile.TemporaryDirectory(prefix="njupt-scan-") as tmp:
         path = Path(tmp) / "object"
-        with path.open("wb") as handle:
-            written = await storage.download_to_file(storage_key, handle)
+        try:
+            with path.open("wb") as handle:
+                written = await storage.download_to_file(storage_key, handle)
+        except ObjectSizeExceeded:
+            return ScanOutcome(status=ScanStatus.REJECTED, reason="size_exceeded")
 
         if written <= 0:
             return ScanOutcome(status=ScanStatus.REJECTED, size=0, reason="empty_file")
@@ -205,8 +223,11 @@ async def scan_quarantined_object(
             return ScanOutcome(status=ScanStatus.REJECTED, size=written, reason="size_exceeded")
 
         sha256 = _sha256(path)
-        detected = _detect_format(path)
         base = {"size": written, "sha256": sha256}
+        try:
+            detected = _detect_format(path)
+        except ParseFailure as exc:
+            return ScanOutcome(status=ScanStatus.REJECTED, reason=f"malformed:{exc}", **base)
         if detected is None:
             return ScanOutcome(status=ScanStatus.REJECTED, detected_mime=None, reason="format_not_allowed", **base)
         if detected not in settings.ALLOWED_UPLOAD_MIME:
@@ -224,6 +245,10 @@ async def scan_quarantined_object(
             return ScanOutcome(status=ScanStatus.FAILED, detected_mime=detected, reason=f"parse_error:{type(exc).__name__}", **base)
 
         verdict = await provider.scan(path)
+        if verdict.status == ScanStatus.PASSED:
+            # 写入本次实际扫描的本地字节，不重新复制仍可被上传凭证覆盖的隔离对象。
+            with path.open("rb") as handle:
+                await storage.put_file(verified_storage_key, handle, detected, bucket=settings.S3_BUCKET_PRIVATE)
         return ScanOutcome(
             status=verdict.status,
             detected_mime=detected,

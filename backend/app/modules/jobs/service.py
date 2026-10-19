@@ -25,7 +25,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, tuple_, update
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,7 +41,7 @@ from app.core.errors import (
     NotFound,
     RateLimited,
 )
-from app.core.pagination import CursorPage, decode_cursor, encode_cursor, normalize_page_size
+from app.core.pagination import CursorPage, encode_cursor, normalize_page_size, seek_descending
 from app.db import async_session_factory
 from app.modules.jobs.models import Job
 from app.modules.jobs.schemas import JobFailureOut, JobOut
@@ -61,8 +61,8 @@ __all__ = [
 # 每个任务类别绑定一个处理器版本，参与幂等约束（§22.2）。
 # file.derive 与 content.derivatives.PROCESSOR_VERSION 保持一致，避免重复派生记录。
 PROCESSOR_VERSIONS: dict[JobType, str] = {
-    JobType.FILE_SCAN: "scan/1",
-    JobType.FILE_DERIVE: "derive/1",
+    JobType.FILE_SCAN: "scan/2",
+    JobType.FILE_DERIVE: "derive/3",
     JobType.NOTIFICATION_DISPATCH: "notify/1",
     JobType.EVENT_FANOUT: "fanout/1",
     JobType.AI_PROCESS: "ai/1",
@@ -82,6 +82,14 @@ class JobPermanentError(Exception):
 
 class JobTransientError(Exception):
     """处理器确认的临时失败：允许重试（§22.2）。"""
+
+
+class JobOutcomeError(Exception):
+    """处理已完成并保存业务失败结果，需要与任务状态一起提交。"""
+
+    def __init__(self, message: str, failure_class: FailureClass):
+        super().__init__(message)
+        self.failure_class = failure_class
 
 
 def _now() -> datetime:
@@ -107,6 +115,8 @@ def _classify(exc: Exception) -> FailureClass:
     - 明确临时：状态冲突（可等待后重试）、依赖不可用、限流、超时、连接错误。
     - 其他未知异常按「可重试」处理，由 `max_attempts` 兜底，避免一次偶发故障直接丢弃任务。
     """
+    if isinstance(exc, JobOutcomeError):
+        return exc.failure_class
     if isinstance(exc, JobPermanentError):
         return FailureClass.PERMANENT
     if isinstance(exc, JobTransientError):
@@ -284,9 +294,9 @@ async def _handle_file_scan(db: AsyncSession, job: Job) -> None:
         return
     if status == ScanStatus.REJECTED:
         # 检测拒绝属永久结果，不无限重试（§22.2）。
-        raise JobPermanentError("文件安全检查拒绝")
+        raise JobOutcomeError("文件安全检查拒绝", FailureClass.PERMANENT)
     # 检查未能完成（扫描器不可用等）：不得默认通过，属临时故障（§13.1、§30）。
-    raise JobTransientError("文件检查未能完成")
+    raise JobOutcomeError("文件检查未能完成", FailureClass.TRANSIENT)
 
 
 async def _handle_file_derive(db: AsyncSession, job: Job) -> None:
@@ -297,7 +307,7 @@ async def _handle_file_derive(db: AsyncSession, job: Job) -> None:
     if status == DerivativeStatus.READY:
         return
     # 转换失败多为格式不可解析；不无限自动重试，由管理员修复转换器后重试（§13.1、§30）。
-    raise JobPermanentError("预览转换失败")
+    raise JobOutcomeError("预览转换失败", FailureClass.PERMANENT)
 
 
 async def _handle_notification_dispatch(db: AsyncSession, job: Job) -> None:
@@ -362,10 +372,12 @@ async def run_job(job_id: str) -> str:
             job = await db.get(Job, job_uuid)
             return job.status if job is not None else JobStatus.FAILED.value
 
+        claimed_type = claimed.job_type
         try:
             await _execute(db, claimed)
         except Exception as exc:  # noqa: BLE001 - 处理器异常必须在此收敛
-            await db.rollback()
+            if not isinstance(exc, JobOutcomeError):
+                await db.rollback()
             failure = _classify(exc)
             status = await _record_failure(db, job_uuid, exc, failure)
             await db.commit()
@@ -373,7 +385,7 @@ async def run_job(job_id: str) -> str:
                 "job_failed",
                 extra={
                     "job_id": str(job_uuid),
-                    "job_type": claimed.job_type,
+                    "job_type": claimed_type,
                     "failure_class": failure.value,
                     "status": status,
                 },
@@ -499,17 +511,7 @@ async def dispatch_due_jobs() -> dict:
 async def _page(db: AsyncSession, stmt, *, limit: int | None, cursor: str | None):
     """按 (created_at, id) 降序的游标分页，默认 20、上限 100（§25.1）。"""
     size = normalize_page_size(limit)
-    if cursor:
-        payload = decode_cursor(cursor)
-        try:
-            last_ts = datetime.fromisoformat(payload["ts"])
-            last_id = uuid.UUID(payload["id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise InvalidInput("cursor 无效", details={"reason": "malformed"}) from exc
-        if last_ts.tzinfo is None:
-            last_ts = last_ts.replace(tzinfo=timezone.utc)
-        stmt = stmt.where(tuple_(Job.created_at, Job.id) < tuple_(last_ts, last_id))
-    stmt = stmt.order_by(Job.created_at.desc(), Job.id.desc()).limit(size + 1)
+    stmt = seek_descending(db, stmt, Job.created_at, Job.id, cursor).limit(size + 1)
     rows = list((await db.execute(stmt)).scalars().all())
     has_more = len(rows) > size
     rows = rows[:size]
@@ -592,7 +594,7 @@ async def retry_job(
     幂等约束（4 元组）不变，因此复用同一行，不产生重复任务或重复产出。
     投递交由扫描器完成（本函数处于请求事务中，提交前投递会读到未提交行）。
     """
-    job = await db.get(Job, job_id)
+    job = await db.scalar(select(Job).where(Job.id == job_id).with_for_update().execution_options(populate_existing=True))
     if job is None:
         raise NotFound("任务不存在")
     if job.status not in (JobStatus.FAILED.value, JobStatus.CANCELLED.value):
@@ -622,4 +624,5 @@ async def retry_job(
         after={"status": JobStatus.QUEUED.value, "job_type": job.job_type},
         request_id=request_id,
     )
+    await db.refresh(job)
     return JobOut.model_validate(job)

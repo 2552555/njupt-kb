@@ -13,11 +13,14 @@ x-backend-env: &backend-env
   CORS_ORIGINS: ${CORS_ORIGINS}
   COOKIE_SECURE: "true"
   S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
+  S3_PUBLIC_ENDPOINT_URL: ${S3_PUBLIC_ENDPOINT_URL:-}
   S3_REGION: ${S3_REGION:-us-east-1}
   S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
   S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
   S3_BUCKET_QUARANTINE: ${S3_BUCKET_QUARANTINE:-njupt-quarantine}
   S3_BUCKET_PRIVATE: ${S3_BUCKET_PRIVATE:-njupt-private}
+  S3_BUCKET_PUBLIC: ${S3_BUCKET_PUBLIC:-njupt-public}
+  S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:-}
   S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-false}
   SCANNER: ${SCANNER:-clamav}
   CLAMD_HOST: ${CLAMD_HOST:-clamav}
@@ -77,8 +80,12 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 --proxy-headers
+    env_file:
+      - .env
     environment:
       <<: *backend-env
+      # 必须与实际反向代理地址对应；遗漏时阻止启动，避免匿名用户共用代理 IP 桶。
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:?请配置实际受信代理IP或网段，禁止使用通配符}
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,10 +94,12 @@ services:
     restart: always
 
   worker:
+    env_file:
+      - .env
     build:
       context: ./backend
       dockerfile: Dockerfile.worker
-    command: celery -A app.workers.celery_app:celery_app worker -Q njupt -l info --concurrency=4
+    command: celery -A app.workers.celery_app:celery_app worker -Q njupt,njupt.scan,njupt.derive,njupt.notify,njupt.ai -l info --concurrency=4
     environment:
       <<: *backend-env
     depends_on:
@@ -125,7 +134,7 @@ services:
       args:
         NEXT_PUBLIC_SITE_URL: ${PUBLIC_BASE_URL}
     environment:
-      NEXT_PUBLIC_API_BASE: http://api:8000
+      API_INTERNAL_URL: http://api:8000
       NEXT_PUBLIC_SITE_URL: ${PUBLIC_BASE_URL}
     depends_on:
       - api

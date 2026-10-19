@@ -1,5 +1,5 @@
-import { redirect } from 'next/navigation';
+import { PersonalOverview } from '@/components/workspace/PersonalOverview';
 
 export default function MeIndexPage() {
-  redirect('/me/resources');
+  return <PersonalOverview />;
 }

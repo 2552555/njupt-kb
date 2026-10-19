@@ -24,11 +24,12 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   const entries: MetadataRoute.Sitemap = [
     { url: `${siteUrl}/`, changeFrequency: 'daily', priority: 1 },
     { url: `${siteUrl}/courses`, changeFrequency: 'daily', priority: 0.8 },
+    { url: `${siteUrl}/requests`, changeFrequency: 'hourly', priority: 0.6 },
   ];
 
   const [courses, resources] = await Promise.all([
     fetchPublic<CursorPage<CourseListItem>>('/courses?limit=100'),
-    fetchPublic<CursorPage<SearchItem>>('/search?limit=100'),
+    fetchPublic<CursorPage<SearchItem>>('/search/resources?limit=100'),
   ]);
 
   for (const course of courses?.items ?? []) {

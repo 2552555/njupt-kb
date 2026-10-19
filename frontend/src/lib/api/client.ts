@@ -99,6 +99,7 @@ let onUnauthorized: () => void = () => {
   if (typeof window === 'undefined') return;
   const next = encodeURIComponent(window.location.pathname + window.location.search);
   if (window.location.pathname !== '/login') {
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- 会话失效时用完整导航清空内存中的私有 Query 缓存。
     window.location.assign(`/login?next=${next}`);
   }
 };

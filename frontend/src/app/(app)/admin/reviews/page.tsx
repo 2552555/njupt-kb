@@ -41,7 +41,13 @@ export default function AdminReviewsPage() {
       });
     },
     onSuccess: (_result, variables) => {
-      toast.success(variables.decision === 'approve' ? '已批准' : '已驳回');
+      const message =
+        variables.decision === 'approve'
+          ? '已批准'
+          : variables.decision === 'needs_info'
+            ? '已要求补充材料'
+            : '已驳回';
+      toast.success(message);
       setActive(null);
       setReason('');
       setConfirmReject(false);
@@ -117,14 +123,14 @@ export default function AdminReviewsPage() {
                   </p>
                   <div className="mt-2 flex flex-wrap gap-3 text-xs">
                     <Link
-                      href={`/resources/${review.resource_id}`}
+                      href={`/me/resources/${review.resource_id}/versions/${review.version_id}`}
                       className="underline underline-offset-2 text-text-secondary hover:text-text-primary"
                     >
                       查看原件与预览
                     </Link>
                   </div>
                   <p className="mt-2 text-xs text-text-secondary">
-                    风险提示：后端未提供结构化风险提示接口，审核员需自行查看文件与来源后判断。
+                    后端未提供结构化风险提示，请自行查看文件与来源后判断。
                   </p>
                 </div>
                 <Button
@@ -176,7 +182,7 @@ export default function AdminReviewsPage() {
           </div>
           {confirmReject && (
             <Notice tone="warning" title="确认驳回？">
-              驳回会通知作者并保留该快照作为审核证据；已发布的旧版本不受影响。
+              驳回会通知作者；已发布的旧版本不受影响。
               决定不可原地覆盖，作者修订后会形成新的提交。
             </Notice>
           )}
@@ -204,6 +210,14 @@ export default function AdminReviewsPage() {
                   disabled={!reason.trim()}
                 >
                   驳回
+                </Button>
+                <Button
+                  variant="ghost"
+                  onClick={() => decisionMutation.mutate({ decision: 'needs_info' })}
+                  isLoading={decisionMutation.isPending}
+                  disabled={!reason.trim()}
+                >
+                  要求补证
                 </Button>
                 <Button
                   variant="primary"

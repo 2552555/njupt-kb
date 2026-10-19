@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from enum import StrEnum
 
 from pydantic import BaseModel
 
@@ -82,6 +83,9 @@ class CourseDetail(BaseModel):
     college_name: str | None = None
     aliases: list[str] = []
     curricula: list[CurriculumLink] = []
+    # 分类资源计数：key 为 resource_type，只统计已发布且对当前查看者可见的资源；
+    # 默认空字典保持既有调用方（未传查看者时）兼容。
+    resource_counts: dict[str, int] = {}
 
 
 class TeacherBrief(BaseModel):
@@ -117,3 +121,81 @@ class CourseSearchFilters:
     semester_id: uuid.UUID | None = None
     teacher_id: uuid.UUID | None = None
     limit: int = 20
+
+
+# --- 管理员目录维护（§11、§15 CATALOG_MANAGE）-----------------------------------
+
+
+class CatalogEntityType(StrEnum):
+    """管理员可维护的目录实体类型（§11.1）。"""
+
+    UNIVERSITY = "university"
+    COLLEGE = "college"
+    MAJOR = "major"
+    COURSE = "course"
+    TEACHER = "teacher"
+    SEMESTER = "semester"
+
+
+class CatalogItemOut(BaseModel):
+    """管理员列表项：包含停用/合并项，普通前台接口不返回这些状态。"""
+
+    id: uuid.UUID
+    name: str
+    status: str
+    code: str | None = None
+    short_name: str | None = None
+    parent_id: uuid.UUID | None = None
+    parent_name: str | None = None
+    academic_year: str | None = None
+    season: str | None = None
+
+
+class CatalogCreateIn(BaseModel):
+    """新建目录项。字段按实体类型取用；service 校验必填项（不臆造父级）。"""
+
+    name: str
+    code: str | None = None
+    short_name: str | None = None
+    slug: str | None = None
+    university_id: uuid.UUID | None = None
+    college_id: uuid.UUID | None = None
+    description: str | None = None
+    academic_year: str | None = None
+    season: str | None = None
+
+
+class CatalogRenameIn(BaseModel):
+    name: str
+    reason: str | None = None
+
+
+class CatalogDeactivateIn(BaseModel):
+    reason: str | None = None
+
+
+class CatalogMergeIn(BaseModel):
+    source_id: uuid.UUID
+    target_id: uuid.UUID
+    reason: str
+
+
+class CatalogReferenceCount(BaseModel):
+    """合并影响面：某一引用表/列中被合并项引用的行数。"""
+
+    table: str
+    column: str
+    label: str
+    count: int
+
+
+class CatalogMergeImpactOut(BaseModel):
+    """合并影响面预览（§11.2 规则 7）：执行前必须先给出引用数量。"""
+
+    entity_type: str
+    source_id: uuid.UUID
+    target_id: uuid.UUID
+    source_name: str
+    target_name: str
+    references: list[CatalogReferenceCount]
+    total: int

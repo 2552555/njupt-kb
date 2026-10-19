@@ -3,7 +3,7 @@
  * 公开只读；不返回草稿或私有文件信息。
  */
 import { api } from './client';
-import type { CursorPage } from './types';
+import type { CursorPage, ResourceType } from './types';
 
 export interface CollegeBrief {
   id: string;
@@ -67,6 +67,8 @@ export interface CourseDetail {
   college_name: string | null;
   aliases: string[];
   curricula: CurriculumLink[];
+  /** 分类资源计数：key 为 resource_type，只含已发布且对当前查看者可见的资源（beta14）。 */
+  resource_counts?: Partial<Record<ResourceType, number>>;
 }
 
 export interface TeacherBrief {

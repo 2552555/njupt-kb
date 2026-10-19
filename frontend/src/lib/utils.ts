@@ -3,6 +3,11 @@ import { zhCN } from 'date-fns/locale';
 
 import { RESOURCE_TYPE_LABELS, type ResourceType } from '@/lib/api/types';
 
+/** 重复 URL 参数采用首值，与客户端 URLSearchParams.get 保持一致。 */
+export function firstSearchParam(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
 export function formatDate(date: string | Date): string {
   return format(new Date(date), 'yyyy年M月d日', { locale: zhCN });
 }
